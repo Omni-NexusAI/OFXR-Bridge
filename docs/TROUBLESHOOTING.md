@@ -1,7 +1,7 @@
 # OFXR Bridge troubleshooting
 
 > [!IMPORTANT]
-> **First, make sure you are on the latest version: 0.2.13.2.** Every
+> **First, make sure you are on the latest version: 0.2.13.3.** Every
 > release fixes problems reported here, so check the
 > [releases page](https://github.com/djules75/OFXR-Bridge/releases) before
 > anything else. The tray's menu shows the version you are running.
@@ -74,6 +74,7 @@ not loaded (Table A).
 | One eye flickers or shimmers and the other is fine (MSFS 2024 with 3X Frame Gen) | Fixed in 0.2.12.2. Update. |
 | One eye stutters in a D3D11 game, and the stutter goes away with OpenXR Toolkit on (IL-2 Great Battles) | Fixed in 0.2.13.2. Update. |
 | On SteamVR, lower frame rates on 0.2.13.1 than on earlier versions, with SteamVR at half your refresh rate (MSFS 2024, often with 3X Frame Gen) | Fixed in 0.2.13.2. Update. |
+| The overlay shows your full refresh rate in green, but the headset looks no smoother than without OFXR, on Pimax OpenXR or Virtual Desktop since 0.2.13.1 (MSFS 2024 with 3X Frame Gen at a high resolution) | Fixed in 0.2.13.3. Update. At a very high resolution a few frames can still be skipped: pick **NVIDIA Fast** or one step down in your headset's render resolution for more headroom. |
 | The frame rate drops when a window or HUD panel appears in the headset, and on Virtual Desktop stays low after it closes (CheekyFoveatedDLSS's F8 window, Skyrim VR's HUD on a Steam Frame) | Fixed in 0.2.13.2. Update. If it still happens, send a flight log. |
 | Stutter or drop-outs that 0.2.9.1 did not have, with VRAM to spare (seen on an AMD RX 9070 XT in AMS2) | Untick **Lower VRAM (may cause stuttering)** in the tray and restart the game. It restores the layout 0.2.9.1 used, at about 15% more VRAM. |
 | You want to know whether a problem comes from OFXR | **Disarm** and restart the game. **Pause frame generation** is not enough: a paused game still runs through OFXR, it only stops making extra frames. |

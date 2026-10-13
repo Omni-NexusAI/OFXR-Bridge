@@ -16,8 +16,14 @@ only (see below).
 Technically, OFXR Bridge is an experimental OpenXR API layer. It uses
 optical flow to generate frames between the ones the game renders.
 
-Current release: **v0.2.13.2 (internal build V443)**.
-See the [release notes](docs/releases/0.2.13.2.md). 0.2.13.2 is a
+Current release: **v0.2.13.3 (internal build V452)**.
+See the [release notes](docs/releases/0.2.13.3.md). 0.2.13.3 is a patch
+release: on Pimax OpenXR, Virtual Desktop and other runtimes that are not
+SteamVR, a demanding game (MSFS 2024 with 3X Frame Gen at a high
+resolution, for example) could show the full refresh rate on the overlay
+while the headset looked no smoother; the generated frames now arrive in
+time to be shown.
+[0.2.13.2](docs/releases/0.2.13.2.md) was a
 maintenance release: MSFS 2024 on SteamVR no longer drops to half rate
 because of a 0.2.13.1 change, D3D11 games such as IL-2 Great Battles no
 longer stutter in one eye without OpenXR Toolkit, windows and HUD panels
