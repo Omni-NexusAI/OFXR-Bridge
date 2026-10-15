@@ -1211,12 +1211,13 @@ void handle_command(AppState& state, UINT command) {
             L"game starts.");
         break;
     case reset_defaults: {
-        // The four options above the entry, taken from LauncherSettings'
-        // own defaults; bidirectional consistency, 3X, the overlay and the
-        // flight recorder are left as they are.
+        // The options that cost the most when changed, taken from
+        // LauncherSettings' own defaults; 3X, the overlay and the flight
+        // recorder are left as they are.
         const xrfg::standalone::LauncherSettings defaults;
         state.settings.backend = defaults.backend;
         state.settings.nvidia_preset = defaults.nvidia_preset;
+        state.settings.nvidia_bidirectional = defaults.nvidia_bidirectional;
         state.settings.nvidia_input_scale = defaults.nvidia_input_scale;
         state.settings.deep_pipeline = defaults.deep_pipeline;
         state.settings.single_swapchain_rings = defaults.single_swapchain_rings;
@@ -1224,9 +1225,9 @@ void handle_command(AppState& state, UINT command) {
         show_balloon(
             state,
             L"Options reset to default",
-            L"Optical flow: NVIDIA Medium at 50% resolution. Prefer FPS over "
-            L"latency: on. Lower VRAM: on. Takes effect the next time the "
-            L"game starts.");
+            L"Optical flow: NVIDIA Medium at 50% resolution, bidirectional "
+            L"consistency off. Prefer FPS over latency: on. Lower VRAM: on. "
+            L"Takes effect the next time the game starts.");
         break;
     }
     case toggle_triple_frame_gen:
