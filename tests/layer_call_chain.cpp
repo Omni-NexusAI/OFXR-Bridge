@@ -276,6 +276,7 @@ std::atomic<std::uint32_t> g_begin_frame_calls{0};
 std::atomic<std::uint32_t> g_end_frame_calls{0};
 std::atomic<std::uint32_t> g_locate_views_calls{0};
 std::atomic<std::uint32_t> g_create_swapchain_calls{0};
+ID3D12Device* g_last_runtime_binding_device{};
 // Split-eye counts the two kinds of creation separately. The layer takes its
 // private swapchains when a projection layer first names an application
 // swapchain rather than when that swapchain's images are enumerated, so both
@@ -483,6 +484,11 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_create_session(
     XrInstance,
     const XrSessionCreateInfo* create_info,
     XrSession* session) {
+    for (auto* binding = create_info ? static_cast<const XrBaseInStructure*>(create_info->next) : nullptr;
+        binding; binding = binding->next) {
+        if (binding->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR)
+            g_last_runtime_binding_device = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(binding)->device;
+    }
     if (g_d3d11_bridge_mode || g_vulkan_bridge_mode) {
         // The bridge hands the runtime a D3D12 binding on the layer's own
         // device. A runtime creates its images on that device; so does the
@@ -553,6 +559,8 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_get_d3d12_graphics_requirements(
         SUCCEEDED(dxgi_device->GetAdapter(adapter.GetAddressOf())) &&
         SUCCEEDED(adapter->GetDesc(&description))) {
         requirements->adapterLuid = description.AdapterLuid;
+    } else if (g_device) {
+        requirements->adapterLuid = g_device->GetAdapterLuid();
     }
     requirements->minFeatureLevel = D3D_FEATURE_LEVEL_11_0;
     return XR_SUCCESS;

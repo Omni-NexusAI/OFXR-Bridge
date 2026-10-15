@@ -184,7 +184,11 @@ LauncherSettings parse_settings(std::string_view text) {
                     std::string_view(line).substr(0, equals)));
                 const std::string value = trim_ascii(
                     std::string_view(line).substr(equals + 1));
-                if (key == "backend") {
+                if (key == "dual_gpu_enabled") {
+                    settings.dual_gpu_enabled = value == "1" || lower_ascii(value) == "true";
+                } else if (key == "dual_gpu_worker_id") {
+                    settings.dual_gpu_worker_id = value;
+                } else if (key == "backend") {
                     settings.backend = lower_ascii(value) == "nvidia"
                         ? FlowBackend::nvidia
                         : FlowBackend::fidelity_fx;
@@ -252,6 +256,8 @@ LauncherSettings parse_settings(std::string_view text) {
 
 std::string serialize_settings(const LauncherSettings& settings) {
     return "[tray]\r\nbackend=" + backend_ini_value(settings.backend) +
+           "\r\ndual_gpu_enabled=" + (settings.dual_gpu_enabled ? "1" : "0") +
+           "\r\ndual_gpu_worker_id=" + settings.dual_gpu_worker_id +
            "\r\nnvidia_preset=" +
            nvidia_preset_ini_value(settings.nvidia_preset) +
            "\r\nnvidia_input_scale=" +
@@ -487,6 +493,8 @@ std::string build_runtime_ini(
     unsigned max_file_mb,
     bool flush_each_event) {
     return "[ofxr]\r\nbackend=" + backend_ini_value(settings.backend) +
+           "\r\ndual_gpu_enabled=" + (settings.dual_gpu_enabled ? "1" : "0") +
+           "\r\ndual_gpu_worker_id=" + settings.dual_gpu_worker_id +
            "\r\nmotion_vectors=dlss" +
            "\r\nnvidia_preset=" +
            nvidia_preset_ini_value(settings.nvidia_preset) +

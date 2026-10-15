@@ -62,6 +62,9 @@ endif()
 
 if(XRFG_BUILD_TESTS)
     enable_testing()
+    add_executable(xrfg_dual_gpu_policy_tests tests/dual_gpu_policy_tests.cpp)
+    target_link_libraries(xrfg_dual_gpu_policy_tests PRIVATE xrfg_core)
+    add_test(NAME xrfg_dual_gpu_policy_tests COMMAND xrfg_dual_gpu_policy_tests)
     add_executable(xrfg_core_tests tests/core_tests.cpp)
     target_link_libraries(xrfg_core_tests PRIVATE xrfg_core)
     if(MSVC)
@@ -83,6 +86,11 @@ if(XRFG_BUILD_TESTS)
 endif()
 
 if(WIN32 AND XRFG_BUILD_LAYER)
+    add_library(xrfg_dual_gpu_adapters STATIC src/common/dual_gpu_adapters.cpp)
+    target_include_directories(xrfg_dual_gpu_adapters PUBLIC include)
+    target_compile_features(xrfg_dual_gpu_adapters PUBLIC cxx_std_20)
+    target_compile_definitions(xrfg_dual_gpu_adapters PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(xrfg_dual_gpu_adapters PUBLIC dxgi gdi32)
     if(NOT EXISTS "${XRFG_OPENXR_SDK_ROOT}/include/openxr/openxr.h" OR
        NOT EXISTS "${XRFG_OPENXR_SDK_ROOT}/include/openxr/openxr_platform_defines.h" OR
        NOT EXISTS "${XRFG_OPENXR_SDK_ROOT}/include/openxr/openxr_loader_negotiation.h" OR
@@ -197,6 +205,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         src/vulkan/vulkan_d3d12_interop.cpp
         src/d3d12/d3d12_history.cpp
         src/d3d12/d3d12_frame_synthesizer.cpp
+        src/d3d12/d3d12_dual_gpu.cpp
         src/common/dlss_motion_vectors.cpp
         "${XRFG_PACK_INPUT_HEADER}"
         "${XRFG_GAME_MOTION_SYNTHESIZE_PIXEL_HEADER}"
@@ -217,6 +226,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
     target_compile_features(xrfg_d3d12_history PUBLIC cxx_std_20)
     target_link_libraries(xrfg_d3d12_history PUBLIC
         xrfg_core
+        xrfg_dual_gpu_adapters
         d3d11
         d3d12
         dxgi
@@ -240,6 +250,13 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         include/xrfg/bridge_flight_logger.hpp)
     target_include_directories(xrfg_bridge_flight_logger PUBLIC include)
     target_link_libraries(xrfg_d3d12_history PUBLIC xrfg_bridge_flight_logger)
+    # Manual opt-in hardware validation. Never included in automatic CTest:
+    # this executable creates real devices on both selected adapters.
+    if(XRFG_BUILD_TESTS)
+        add_executable(xrfg_dual_gpu_probe tests/dual_gpu_probe.cpp)
+        target_link_libraries(xrfg_dual_gpu_probe PRIVATE xrfg_d3d12_history)
+        target_compile_definitions(xrfg_dual_gpu_probe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    endif()
     target_compile_features(xrfg_bridge_flight_logger PUBLIC cxx_std_20)
     target_compile_definitions(xrfg_bridge_flight_logger PRIVATE
         NOMINMAX
@@ -364,6 +381,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             src/tray/resources.rc)
         target_link_libraries(OFXRBridgeTray PRIVATE
             xrfg_standalone_core
+            xrfg_dual_gpu_adapters
             comctl32
             gdi32
             ole32
@@ -416,7 +434,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
                 COMMAND xrfg_standalone_launcher_tests)
             add_executable(xrfg_tray_lifecycle_tests tests/tray_lifecycle_tests.cpp)
             target_link_libraries(xrfg_tray_lifecycle_tests PRIVATE
-                xrfg_standalone_core comctl32 gdi32 ole32 shell32 user32)
+                xrfg_standalone_core xrfg_dual_gpu_adapters comctl32 gdi32 ole32 shell32 user32)
             target_compile_definitions(xrfg_tray_lifecycle_tests PRIVATE
                 XRFG_IMPLEMENTATION_VERSION=${PROJECT_VERSION_MINOR}
                 NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
@@ -550,6 +568,10 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             target_compile_options(xrfg_layer_manual_disarm_tests PRIVATE /W4 /permissive- /EHsc)
         endif()
         add_dependencies(xrfg_layer_manual_disarm_tests XR_APILAYER_XRFrameBridge_diagnostic)
+        foreach(mode offload-negative offload-negative-empty offload-negative-split)
+            add_test(NAME xrfg_${mode}_warp COMMAND xrfg_layer_manual_disarm_tests
+                "$<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic>" ${mode})
+        endforeach()
         foreach(mode inline d3d11 steamvr flight)
             add_test(NAME xrfg_manual_disarm_${mode} COMMAND xrfg_layer_manual_disarm_tests
                 $<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic> ${mode})

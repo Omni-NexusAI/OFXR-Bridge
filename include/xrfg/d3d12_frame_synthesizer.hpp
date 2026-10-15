@@ -13,8 +13,10 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string_view>
 
 namespace xrfg {
+struct DualGpuTiming;
 
 struct D3D12FieldOfView {
     float angle_left{};
@@ -60,6 +62,9 @@ struct D3D12FrameSynthesisTicket {
     std::uint32_t synthetic_destination_index{
         std::numeric_limits<std::uint32_t>::max()};
     std::uint32_t current_destination_index{};
+    // Nonzero only for the custom backend. These bind results to this exact
+    // engine lifetime, capture and immutable stereo camera description.
+    std::uint64_t offload_generation{}, offload_token{}, offload_views_hash{};
 };
 
 // Completed direct-queue GPU intervals for one NVIDIA Optical Flow pair.
@@ -161,6 +166,20 @@ public:
             D3D12OpticalFlowBackend::fidelity_fx,
         D3D12NvidiaOpticalFlowOptions nvidia_options = {},
         bool enable_nvidia_gpu_timing = false) noexcept;
+
+    [[nodiscard]] HRESULT initialize_dual_gpu(ID3D12Device*, ID3D12CommandQueue*,
+        std::shared_ptr<D3D12SwapchainHistory>, std::span<ID3D12Resource* const>,
+        std::span<ID3D12Resource* const>, DXGI_FORMAT, D3D12_RESOURCE_STATES,
+        std::wstring_view worker_id, D3D12NvidiaOpticalFlowOptions) noexcept;
+    [[nodiscard]] bool dual_gpu() const noexcept;
+    [[nodiscard]] bool offload_ready(const D3D12FrameSynthesisTicket&) noexcept;
+    [[nodiscard]] HRESULT publish_offload(const D3D12FrameSynthesisTicket&) noexcept;
+    void discard_offload(const D3D12FrameSynthesisTicket&) noexcept;
+    void offload_budget_us(std::uint64_t) noexcept;
+    [[nodiscard]] HRESULT consume_dual_gpu_timing(DualGpuTiming*) noexcept;
+    // Synthetic validation executable only; no INI or runtime control enables
+    // these fault injections. Delay holds CPU dispatch, never a GPU queue.
+    void offload_test_controls(std::uint32_t worker_delay_ms, bool worker_failure) noexcept;
 
     [[nodiscard]] HRESULT submit_prime(
         const D3D12HistoryCaptureTicket& current,
@@ -291,6 +310,7 @@ private:
 
     mutable std::mutex mutex_;
     std::unique_ptr<Impl> impl_;
+    std::unique_ptr<class D3D12DualGpuOffload> offload_;
 };
 
 }  // namespace xrfg

@@ -1,4 +1,5 @@
 #include "xrfg/d3d12_frame_synthesizer.hpp"
+#include "xrfg/d3d12_dual_gpu.hpp"
 #include "xrfg/bridge_flight_logger.hpp"
 
 #include <windows.h>
@@ -4763,6 +4764,7 @@ HRESULT D3D12FrameSynthesizer::reconfigure(D3D12OpticalFlowBackend backend,
     D3D12NvidiaOpticalFlowOptions options) noexcept {
     try {
         std::scoped_lock lock(mutex_);
+        if (offload_) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED); // recreate the session to change worker/options
         if (!impl_) return E_UNEXPECTED;
         const HRESULT idle = impl_->wait_for_idle();
         if (FAILED(idle)) return idle; // never free pending GPU work
@@ -4783,6 +4785,7 @@ HRESULT D3D12FrameSynthesizer::reconfigure(D3D12OpticalFlowBackend backend,
 HRESULT D3D12FrameSynthesizer::reconfigure_gpu_timing(bool enabled) noexcept {
     try {
         std::scoped_lock lock(mutex_);
+        if (offload_) return S_OK; // transport timing is always enabled in the prototype
         if (!impl_) return E_UNEXPECTED;
         const HRESULT idle = impl_->wait_for_idle();
         if (FAILED(idle)) return idle; // never free pending GPU work
@@ -4803,7 +4806,7 @@ HRESULT D3D12FrameSynthesizer::reconfigure_gpu_timing(bool enabled) noexcept {
 bool D3D12FrameSynthesizer::gpu_timing_enabled() noexcept {
     try {
         std::scoped_lock lock(mutex_);
-        return impl_ && impl_->nvidia_gpu_timing_enabled;
+        return offload_ != nullptr || (impl_ && impl_->nvidia_gpu_timing_enabled);
     } catch (...) {
         return false;
     }
@@ -4817,6 +4820,8 @@ HRESULT D3D12FrameSynthesizer::submit_prime(
     std::shared_ptr<const DlssMotionVectorSet> motion_vectors) noexcept {
     try {
         std::scoped_lock lock(mutex_);
+        if (offload_) return offload_->submit(current, current_source_views, {}, 0,
+            current_destination_index, ticket, false, 0.5F);
         if (impl_ == nullptr) {
             if (ticket != nullptr) {
                 *ticket = {};
@@ -4851,6 +4856,11 @@ HRESULT D3D12FrameSynthesizer::submit_pair(
     std::optional<D3D12ExtraSynthetic> extra_synthetic) noexcept {
     try {
         std::scoped_lock lock(mutex_);
+        if (offload_) {
+            if (extra_synthetic) return E_INVALIDARG;
+            return offload_->submit(current, current_source_views, synthetic_target_views,
+                synthetic_destination_index, current_destination_index, ticket, true, interpolation_fraction);
+        }
         if (impl_ == nullptr) {
             if (ticket != nullptr) {
                 *ticket = {};
@@ -4882,6 +4892,7 @@ HRESULT D3D12FrameSynthesizer::flush_current_copy(
     std::uint64_t copy_fence_value) noexcept {
     try {
         std::scoped_lock lock(mutex_);
+        if (offload_) return S_OK; // original was submitted independently at capture
         if (impl_ == nullptr) {
             return S_OK;
         }
@@ -4917,6 +4928,7 @@ HRESULT D3D12FrameSynthesizer::flush_current_copy(
 HRESULT D3D12FrameSynthesizer::retire_previous() noexcept {
     try {
         std::scoped_lock lock(mutex_);
+        if (offload_) return offload_->retire_previous();
         return impl_ == nullptr ? S_OK : impl_->retire_previous();
     } catch (...) {
         return E_FAIL;
@@ -4926,6 +4938,7 @@ HRESULT D3D12FrameSynthesizer::retire_previous() noexcept {
 HRESULT D3D12FrameSynthesizer::wait_for_idle() noexcept {
     try {
         std::scoped_lock lock(mutex_);
+        if (offload_) return offload_->idle();
         return impl_ == nullptr ? S_OK : impl_->wait_for_idle();
     } catch (...) {
         return E_FAIL;
@@ -4936,6 +4949,7 @@ HRESULT D3D12FrameSynthesizer::wait_for_previous_submission(
     std::uint32_t timeout_milliseconds) noexcept {
     try {
         std::scoped_lock lock(mutex_);
+        if (offload_) return S_OK; // worker admission is nonblocking; never throttle the application for it
         return impl_ == nullptr
             ? S_OK
             : impl_->wait_for_previous_submission(timeout_milliseconds);
@@ -4948,6 +4962,7 @@ HRESULT D3D12FrameSynthesizer::consume_nvidia_gpu_timing(
     D3D12NvidiaGpuTiming* timing) noexcept {
     try {
         std::scoped_lock lock(mutex_);
+        if (offload_) return offload_->timing(timing);
         if (impl_ == nullptr) {
             if (timing != nullptr) {
                 *timing = {};
@@ -4967,6 +4982,7 @@ HRESULT D3D12FrameSynthesizer::synchronize_producer_queue(
     ID3D12CommandQueue* queue) noexcept {
     try {
         std::scoped_lock lock(mutex_);
+        if (offload_) return S_OK; // only layer-owned staging is supported, no runtime image is written here
         if (impl_ == nullptr || queue == nullptr) {
             return E_INVALIDARG;
         }
@@ -4996,6 +5012,7 @@ HRESULT D3D12FrameSynthesizer::synchronize_consumer_queue(
     const D3D12FrameSynthesisTicket& ticket) noexcept {
     try {
         std::scoped_lock lock(mutex_);
+        if (offload_) return offload_->synchronize_consumer(queue, ticket);
         if (impl_ == nullptr || queue == nullptr) {
             return E_INVALIDARG;
         }
@@ -5038,6 +5055,7 @@ HRESULT D3D12FrameSynthesizer::completion_fence(
         }
         *output_fence = nullptr;
         std::scoped_lock lock(mutex_);
+        if (offload_) return offload_->completion_fence(output_fence);
         if (impl_ == nullptr || impl_->fence == nullptr) {
             return E_UNEXPECTED;
         }
@@ -5052,10 +5070,42 @@ HRESULT D3D12FrameSynthesizer::completion_fence(
 bool D3D12FrameSynthesizer::initialized() const noexcept {
     try {
         std::scoped_lock lock(mutex_);
-        return impl_ != nullptr && impl_->synthesis_enabled;
+        return offload_ != nullptr || (impl_ != nullptr && impl_->synthesis_enabled);
     } catch (...) {
         return false;
     }
 }
 
+HRESULT D3D12FrameSynthesizer::initialize_dual_gpu(ID3D12Device* device, ID3D12CommandQueue* queue,
+    std::shared_ptr<D3D12SwapchainHistory> history, std::span<ID3D12Resource* const> current,
+    std::span<ID3D12Resource* const> synthetic, DXGI_FORMAT format, D3D12_RESOURCE_STATES state,
+    std::wstring_view worker_id, D3D12NvidiaOpticalFlowOptions options) noexcept {
+    try {
+        std::scoped_lock lock(mutex_);
+        if (impl_ || offload_) return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
+        auto candidate = std::make_unique<D3D12DualGpuOffload>();
+        const auto hr = candidate->initialize(device, queue, std::move(history), current, synthetic, format, state, worker_id, options);
+        if (SUCCEEDED(hr)) offload_ = std::move(candidate);
+        return hr;
+    } catch (...) { return E_FAIL; }
+}
+bool D3D12FrameSynthesizer::dual_gpu() const noexcept { std::scoped_lock lock(mutex_); return offload_ != nullptr; }
+bool D3D12FrameSynthesizer::offload_ready(const D3D12FrameSynthesisTicket& ticket) noexcept {
+    std::scoped_lock lock(mutex_); return offload_ && offload_->ready(ticket);
+}
+HRESULT D3D12FrameSynthesizer::publish_offload(const D3D12FrameSynthesisTicket& ticket) noexcept {
+    std::scoped_lock lock(mutex_); return offload_ ? offload_->publish(ticket) : E_UNEXPECTED;
+}
+void D3D12FrameSynthesizer::discard_offload(const D3D12FrameSynthesisTicket& ticket) noexcept {
+    std::scoped_lock lock(mutex_); if (offload_) offload_->discard(ticket);
+}
+void D3D12FrameSynthesizer::offload_budget_us(std::uint64_t us) noexcept {
+    std::scoped_lock lock(mutex_); if (offload_) offload_->set_budget_us(us);
+}
+HRESULT D3D12FrameSynthesizer::consume_dual_gpu_timing(DualGpuTiming* timing) noexcept {
+    std::scoped_lock lock(mutex_); return offload_ ? offload_->transport_timing(timing) : S_FALSE;
+}
+void D3D12FrameSynthesizer::offload_test_controls(std::uint32_t delay, bool failure) noexcept {
+    std::scoped_lock lock(mutex_); if (offload_) offload_->test_controls(delay, failure);
+}
 }  // namespace xrfg

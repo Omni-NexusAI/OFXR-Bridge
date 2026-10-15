@@ -42,6 +42,9 @@ struct FinishedEarly {};
 int main(int argc, char** argv) {
     if (argc < 3) return 1;
     const std::string mode = argv[2];
+    const bool offload_split = mode == "offload-negative-split";
+    const bool offload_negative = mode == "offload-negative" || mode == "offload-negative-empty" || offload_split;
+    g_split_eye_mode = offload_split;
     // "pacing <runtime> <shape> <game_ms> <seconds> [log_copy]": the release
     // hold against a runtime that paces its waits to a 100 Hz display, with
     // an application that spends game_ms of wall time on each frame between
@@ -145,6 +148,7 @@ int main(int argc, char** argv) {
     XrInstance instance = XR_NULL_HANDLE;
     XrSession session = XR_NULL_HANDLE;
     XrSwapchain swapchain = XR_NULL_HANDLE;
+    XrSwapchain right_swapchain = XR_NULL_HANDLE;
     PFN_xrEndSession end_session = nullptr;
     PFN_xrDestroySession destroy_session = nullptr;
     PFN_xrDestroySwapchain destroy_swapchain = nullptr;
@@ -170,12 +174,15 @@ int main(int argc, char** argv) {
         {
             std::ofstream ini(root / L"ofxr_bridge.ini");
             ini << "[ofxr]\nbackend=fidelityfx\ncontrol_event=" << ascii_control;
+            if (offload_negative) ini << "\ndual_gpu_enabled=1\ndual_gpu_worker_id="
+                << (mode == "offload-negative-empty" ? "" : "pci:missing-test-worker")
+                << "\ntriple_frame_gen=1\nsingle_swapchain_rings=1\nmotion_vectors=dlss\n";
             if (pacing_test)
                 ini << "\ndeep_pipeline=" << (pacing_depth != "shallow" ? 1 : 0)
                     << "\ntriple_frame_gen=" << (pacing_depth == "triple" ? 1 : 0);
             ini // The hand-off and the pacing are read back from the flight log.
                 << "\n[diagnostics]\nlogging_enabled="
-                << (pacing_test || handoff_loop || marker_mode == "on" || marker_mode == "hidden" ? 1 : 0)
+                << (offload_negative || pacing_test || handoff_loop || marker_mode == "on" || marker_mode == "hidden" ? 1 : 0)
                 << "\nmax_file_mb=" << (pacing_test ? 256 : 32)
                 << "\n[overlay]\nposition=" << (!marker_mode.empty() && marker_mode != "hidden" ? "upper_right" : "off") << '\n';
         }
@@ -247,6 +254,7 @@ int main(int argc, char** argv) {
         const auto wait = get_layer_function<PFN_xrWaitFrame>(get, "xrWaitFrame");
         const auto begin = get_layer_function<PFN_xrBeginFrame>(get, "xrBeginFrame");
         const auto end = get_layer_function<PFN_xrEndFrame>(get, "xrEndFrame");
+        const auto requirements = get_layer_function<PFN_xrGetD3D12GraphicsRequirementsKHR>(get, "xrGetD3D12GraphicsRequirementsKHR");
         require(create_session && begin_session && create_swapchain && enumerate && acquire && wait_image && release_image && wait && begin && end,
             "frame functions");
         XrGraphicsBindingD3D12KHR binding12{XR_TYPE_GRAPHICS_BINDING_D3D12_KHR};
@@ -263,7 +271,7 @@ int main(int argc, char** argv) {
         XrSwapchainCreateInfo sc{XR_TYPE_SWAPCHAIN_CREATE_INFO};
         sc.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
         sc.format = DXGI_FORMAT_R8G8B8A8_UNORM; sc.sampleCount = 1;
-        sc.width = sc.height = 4; sc.faceCount = 1; sc.arraySize = 2; sc.mipCount = 1;
+        sc.width = sc.height = 4; sc.faceCount = 1; sc.arraySize = offload_split ? 1 : 2; sc.mipCount = 1;
         require(XR_SUCCEEDED(create_swapchain(session, &sc, &swapchain)), "create swapchain");
         std::array<XrSwapchainImageD3D12KHR, 3> images12{};
         std::array<XrSwapchainImageD3D11KHR, 3> images11{};
@@ -273,12 +281,22 @@ int main(int argc, char** argv) {
         require(XR_SUCCEEDED(enumerate(swapchain, 3, &count, g_d3d11_interop_mode
             ? reinterpret_cast<XrSwapchainImageBaseHeader*>(images11.data())
             : reinterpret_cast<XrSwapchainImageBaseHeader*>(images12.data()))), "enumerate images");
+        const auto create_right = [&] {
+            if (!offload_split) return;
+            require(XR_SUCCEEDED(create_swapchain(session, &sc, &right_swapchain)), "create separate right-eye swapchain");
+            require(XR_SUCCEEDED(enumerate(right_swapchain, 3, &count,
+                reinterpret_cast<XrSwapchainImageBaseHeader*>(images12.data()))), "enumerate separate right-eye images");
+        };
+        create_right();
         const auto capture = [&] {
             XrSwapchainImageAcquireInfo a{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
             XrSwapchainImageWaitInfo w{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; w.timeout = XR_INFINITE_DURATION;
             XrSwapchainImageReleaseInfo r{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}; uint32_t index{};
             require(XR_SUCCEEDED(acquire(swapchain, &a, &index)) && XR_SUCCEEDED(wait_image(swapchain, &w)) &&
                 XR_SUCCEEDED(release_image(swapchain, &r)), "capture/release image");
+            if (offload_split) require(XR_SUCCEEDED(acquire(right_swapchain, &a, &index)) &&
+                XR_SUCCEEDED(wait_image(right_swapchain, &w)) && XR_SUCCEEDED(release_image(right_swapchain, &r)),
+                "capture/release separate right-eye image");
         };
         const auto submit = [&](XrTime time) {
             std::array<XrCompositionLayerProjectionView, 2> views{};
@@ -286,8 +304,8 @@ int main(int argc, char** argv) {
                 const auto view = fake_submitted_view_for_time(time, i);
                 views[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                 views[i].pose = view.pose; views[i].fov = view.fov;
-                views[i].subImage.swapchain = swapchain;
-                views[i].subImage.imageRect.extent = {4, 4}; views[i].subImage.imageArrayIndex = i;
+                views[i].subImage.swapchain = offload_split && i == 1 ? right_swapchain : swapchain;
+                views[i].subImage.imageRect.extent = {4, 4}; views[i].subImage.imageArrayIndex = offload_split ? 0 : i;
             }
             XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
             projection.space = g_space; projection.viewCount = 2; projection.views = views.data();
@@ -302,6 +320,56 @@ int main(int argc, char** argv) {
             g_application_in_end_frame.store(false, std::memory_order_release);
             require(XR_SUCCEEDED(end_result), "end frame");
         };
+        if (offload_negative) {
+            // initialize_d3d12 explicitly creates WARP. A deliberately missing
+            // worker identity cannot reach D3D12CreateDevice on real hardware.
+            require(!g_d3d11_interop_mode, "negative offload test is WARP D3D12 only");
+            const auto original_luid = g_device->GetAdapterLuid();
+            const auto verify_binding = [&] {
+                require(g_last_runtime_binding_device == g_device.Get(), "runtime device remains the application's WARP device");
+                XrGraphicsRequirementsD3D12KHR req{XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR};
+                require(requirements && XR_SUCCEEDED(requirements(instance, 1, &req)), "graphics requirements pass through");
+                require(req.adapterLuid.HighPart == original_luid.HighPart && req.adapterLuid.LowPart == original_luid.LowPart,
+                    "runtime adapter LUID contract unchanged");
+            };
+            const auto run_originals = [&] {
+                verify_binding();
+                std::size_t before{};
+                { std::scoped_lock lock(g_end_records_mutex); before = g_end_records.size(); }
+                for (int i = 0; i < 8; ++i) {
+                    XrFrameState frame{XR_TYPE_FRAME_STATE};
+                    require(XR_SUCCEEDED(wait(session, nullptr, &frame)), "offload rejection wait continues");
+                    require(frame.predictedDisplayPeriod != kFakeDisplayPeriod * 3, "custom mode does not enable 3x");
+                    require(XR_SUCCEEDED(begin(session, nullptr)), "offload rejection begin continues");
+                    capture(); submit(frame.predictedDisplayTime);
+                    require(wait_for_queue_idle(), "WARP primary copies retire");
+                }
+                require(g_synthetic_release_calls.load() == 0, "missing worker never publishes a synthetic");
+                if (offload_split) require(g_split_eye_private_creates.load() == 0,
+                    "split-eye offload rejected before private resources or worker contexts initialize");
+                std::scoped_lock lock(g_end_records_mutex);
+                require(g_end_records.size() >= before + 8, "original frames continue through initialization failure");
+                for (std::size_t i = before; i < g_end_records.size(); ++i)
+                    require(g_end_records[i].target == SubmittedTarget::original, "failed offload uses original both-eye frame");
+            };
+            run_originals();
+            require(XR_SUCCEEDED(end_session(session)), "end rejected-worker session");
+            require(XR_SUCCEEDED(destroy_swapchain(swapchain)), "destroy rejected-worker swapchain"); swapchain = XR_NULL_HANDLE;
+            if (right_swapchain) { require(XR_SUCCEEDED(destroy_swapchain(right_swapchain)), "destroy right-eye swapchain"); right_swapchain = XR_NULL_HANDLE; }
+            require(XR_SUCCEEDED(destroy_session(session)), "destroy rejected-worker session"); session = XR_NULL_HANDLE;
+            require(!std::filesystem::exists(root / L"presentation_gpu.txt"), "session-owned diagnostic removed on teardown");
+            g_create_swapchain_calls = 0;
+            g_split_eye_application_creates = 0;
+            require(XR_SUCCEEDED(create_session(instance, &session_info, &session)), "recreate WARP session");
+            require(XR_SUCCEEDED(begin_session(session, &begin_info)), "begin recreated session");
+            require(XR_SUCCEEDED(create_swapchain(session, &sc, &swapchain)), "recreate swapchain");
+            require(XR_SUCCEEDED(enumerate(swapchain, 3, &count,
+                reinterpret_cast<XrSwapchainImageBaseHeader*>(images12.data()))), "enumerate recreated images");
+            create_right();
+            run_originals();
+            std::cout << "WARP offload negative: runtime binding/requirements preserved, originals continue, 3x blocked, recreation PASS\n";
+            result = 0; throw FinishedEarly{};
+        }
         if (recorder_test) {
             const auto ini_path = root / L"ofxr_bridge.ini";
             const auto logs = [&] {
@@ -851,10 +919,10 @@ int main(int argc, char** argv) {
 #endif
         if (!marker_mode.empty()) {
             const auto synthetic = marker_pixels(g_d3d11_synthetic_swapchain_images);
-            for (const auto count : synthetic)
-                require((count > 0) == (marker_mode == "on"), "D3D11 published marker/debug/Off gate");
+            for (const auto pixel_count : synthetic)
+                require((pixel_count > 0) == (marker_mode == "on"), "D3D11 published marker/debug/Off gate");
             for (const auto* images : {&g_d3d11_application_swapchain_images, &g_d3d11_current_swapchain_images})
-                for (const auto count : marker_pixels(*images)) require(count == 0, "marker contaminated an original");
+                for (const auto pixel_count : marker_pixels(*images)) require(pixel_count == 0, "marker contaminated an original");
             std::cout << "D3D11 runtime-facing synthetic marker " << marker_mode << ": "
                       << synthetic[0] << '/' << synthetic[1] << " purple pixels; originals clean\n";
         }
@@ -863,6 +931,7 @@ int main(int argc, char** argv) {
     } catch (const std::exception& error) { std::cerr << mode << ": " << error.what() << '\n'; }
     if (session && end_session) end_session(session);
     if (swapchain && destroy_swapchain) destroy_swapchain(swapchain);
+    if (right_swapchain && destroy_swapchain) destroy_swapchain(right_swapchain);
     if (session && destroy_session) destroy_session(session);
     if (instance && destroy_instance) destroy_instance(instance);
     if (module) FreeLibrary(module);

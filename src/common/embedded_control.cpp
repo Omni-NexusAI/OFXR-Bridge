@@ -32,6 +32,10 @@ struct Control {
         wchar_t motion[16]{};
         GetPrivateProfileStringW(L"ofxr", L"motion_vectors", L"off", motion, 16, ini().c_str());
         settings.motion_vectors = _wcsicmp(motion, L"dlss") == 0 ? 1 : 0;
+        settings.dual_gpu_enabled = GetPrivateProfileIntW(L"ofxr", L"dual_gpu_enabled", 0, ini().c_str()) != 0;
+        wchar_t worker[2048]{};
+        GetPrivateProfileStringW(L"ofxr", L"dual_gpu_worker_id", L"", worker, 2048, ini().c_str());
+        settings.dual_gpu_worker_id = worker;
     }
 };
 Control& control() { static Control state; return state; }
@@ -68,6 +72,8 @@ bool request(Settings s) {
     if (old.scale != s.scale) ok &= write(L"ofxr", L"nvidia_input_scale", scales[s.scale]);
     if (old.backward != s.backward) ok &= write(L"ofxr", L"nvidia_bidirectional", s.backward ? L"1" : L"0");
     if (old.motion_vectors != s.motion_vectors) ok &= write(L"ofxr", L"motion_vectors", s.motion_vectors ? L"dlss" : L"off");
+    if (old.dual_gpu_enabled != s.dual_gpu_enabled) ok &= write(L"ofxr", L"dual_gpu_enabled", s.dual_gpu_enabled ? L"1" : L"0");
+    if (old.dual_gpu_worker_id != s.dual_gpu_worker_id) ok &= write(L"ofxr", L"dual_gpu_worker_id", s.dual_gpu_worker_id.c_str());
     if (old != s) { c.settings = s; ++c.revision; }
     return ok;
 }

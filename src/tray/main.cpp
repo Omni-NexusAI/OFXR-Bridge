@@ -1,5 +1,6 @@
 #include "xrfg/implicit_layer.hpp"
 #include "xrfg/standalone_launcher.hpp"
+#include "xrfg/d3d12_dual_gpu.hpp"
 #include "resource.h"
 
 #include <windows.h>
@@ -26,14 +27,16 @@
 
 namespace {
 
-constexpr wchar_t kWindowClass[] = L"OFXRBridgeTrayWindow";
-constexpr wchar_t kApplicationName[] = L"OFXR Bridge";
+constexpr wchar_t kWindowClass[] = L"OFXRDualGpuTrayWindow";
+constexpr wchar_t kApplicationName[] = L"OFXR Bridge - Dual GPU Prototype";
 constexpr wchar_t kCleanupArgument[] = L"--cleanup-manual-arm";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT_PTR kTrayId = 1;
 constexpr int kPauseHotkeyId = 1;
 constexpr UINT kArmPollMilliseconds = 250;
-constexpr std::uint32_t kImplementationVersion = XRFG_IMPLEMENTATION_VERSION;
+// Stock recognizes and retires stale manual registrations in this shared root.
+// Use a distinct cache version and settings file without weakening its mutex.
+constexpr std::uint32_t kImplementationVersion = XRFG_IMPLEMENTATION_VERSION * 1000 + 1;
 // One Donate entry each, creator first, as in the About box and the README.
 constexpr wchar_t kDonateCreatorUrl[] = L"https://ko-fi.com/tig3rmast3r";
 constexpr wchar_t kDonateMaintainerUrl[] = L"https://ko-fi.com/djules";
@@ -58,6 +61,9 @@ enum MenuCommand : UINT {
     toggle_triple_frame_gen = 119,
     toggle_lower_vram = 126,
     reset_defaults = 127,
+    toggle_dual_gpu = 160,
+    worker_gpu_first = 200,
+    worker_gpu_last = 299,
     toggle_diagnostics = 120,
     overlay_off = 121,
     overlay_upper_left = 122,
@@ -97,6 +103,7 @@ struct AppState {
     HICON disarmed_icon{};
     UINT taskbar_created_message{};
     bool armed{};
+    std::vector<xrfg::DualGpuAdapter> worker_adapters;
 };
 
 [[nodiscard]] std::wstring last_error_message(std::wstring_view action) {
@@ -925,6 +932,15 @@ void change_pause_hotkey(AppState& state) {
     }
 }
 
+[[nodiscard]] std::string hardware_id_ascii(std::wstring_view value) {
+    std::string result;
+    for (const wchar_t c : value) {
+        if (c < 32 || c > 126) return {};
+        result.push_back(static_cast<char>(c));
+    }
+    return result;
+}
+
 void show_context_menu(AppState& state) {
     HMENU menu = CreatePopupMenu();
     HMENU backend_menu = CreatePopupMenu();
@@ -944,6 +960,39 @@ void show_context_menu(AppState& state) {
         state.armed
             ? L"Disarm bridge"
             : L"Arm bridge until manual disarm");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    HMENU worker_menu = CreatePopupMenu();
+    if (worker_menu) {
+        state.worker_adapters = xrfg::enumerate_dual_gpu_adapters();
+        std::erase_if(state.worker_adapters, [](const auto& a) { return a.vendor_id != 0x10de; });
+        bool selected_available = false;
+        for (std::size_t index = 0; index < state.worker_adapters.size() &&
+             index <= worker_gpu_last - worker_gpu_first; ++index) {
+            const auto& adapter = state.worker_adapters[index];
+            const std::string identity = hardware_id_ascii(adapter.durable_id);
+            const bool selected = identity == state.settings.dual_gpu_worker_id;
+            selected_available |= selected;
+            const std::wstring label = adapter.description + L" [" + adapter.durable_id.substr(0, 30) + L"]";
+            AppendMenuW(worker_menu, MF_STRING | (selected ? MF_CHECKED : MF_UNCHECKED),
+                worker_gpu_first + static_cast<UINT>(index), label.c_str());
+        }
+        if (state.worker_adapters.empty())
+            AppendMenuW(worker_menu, MF_STRING | MF_GRAYED, 0, L"No unambiguous NVIDIA adapter available");
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(worker_menu), L"Worker GPU (next session)");
+        AppendMenuW(menu, MF_STRING | (state.settings.dual_gpu_enabled ? MF_CHECKED : MF_UNCHECKED) |
+            ((selected_available || state.settings.dual_gpu_enabled) ? MF_ENABLED : MF_GRAYED),
+            toggle_dual_gpu, L"Dual-GPU offload (experimental, 2X, next session)");
+        if (!selected_available && !state.settings.dual_gpu_worker_id.empty())
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"Saved worker unavailable; offload will stay off");
+    }
+    // This is reported by the actual OpenXR session; desktop ownership is not evidence.
+    std::wstring presentation = L"Presentation GPU: determined by the OpenXR session";
+    std::ifstream report(runtime_directory(state.local_directory) / L"presentation_gpu.txt");
+    std::string report_pid, report_name;
+    if (std::getline(report, report_pid) && std::getline(report, report_name) &&
+        !report_name.empty() && report_name.size() < 256)
+        presentation = L"Presentation GPU (last session): " + std::wstring(report_name.begin(), report_name.end());
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, presentation.c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(
         menu,
@@ -1065,7 +1114,8 @@ void show_context_menu(AppState& state) {
             : L"Prefer FPS over latency");
     AppendMenuW(
         menu,
-        MF_STRING | (state.settings.triple_frame_gen ? MF_CHECKED : MF_UNCHECKED),
+        MF_STRING | (state.settings.triple_frame_gen ? MF_CHECKED : MF_UNCHECKED) |
+            (state.settings.dual_gpu_enabled ? MF_GRAYED : MF_ENABLED),
         toggle_triple_frame_gen,
         L"3X Frame Gen [live change]");
     AppendMenuW(
@@ -1120,7 +1170,24 @@ void show_context_menu(AppState& state) {
 }
 
 void handle_command(AppState& state, UINT command) {
+    if (command >= worker_gpu_first && command <= worker_gpu_last) {
+        const auto index = static_cast<std::size_t>(command - worker_gpu_first);
+        if (index < state.worker_adapters.size()) {
+            const auto& id = state.worker_adapters[index].durable_id;
+            state.settings.dual_gpu_worker_id = hardware_id_ascii(id);
+            update_runtime_options(state);
+        }
+        return;
+    }
     switch (command) {
+    case toggle_dual_gpu:
+        state.settings.dual_gpu_enabled = !state.settings.dual_gpu_enabled;
+        if (state.settings.dual_gpu_enabled) {
+            state.settings.backend = xrfg::standalone::FlowBackend::nvidia;
+            state.settings.triple_frame_gen = false;
+        }
+        update_runtime_options(state);
+        break;
     case toggle_arm:
         if (state.armed) {
             std::wstring error;
@@ -1161,6 +1228,7 @@ void handle_command(AppState& state, UINT command) {
         change_pause_hotkey(state);
         break;
     case backend_fidelity_fx:
+        state.settings.dual_gpu_enabled = false;
         state.settings.backend = xrfg::standalone::FlowBackend::fidelity_fx;
         update_runtime_options(state);
         break;
@@ -1260,6 +1328,10 @@ void handle_command(AppState& state, UINT command) {
             L"starts.");
         break;
     case toggle_triple_frame_gen:
+        if (state.settings.dual_gpu_enabled) {
+            show_error(state.window, L"Disable dual-GPU offload before choosing 3X Frame Gen. Offload supports 2X only.");
+            break;
+        }
         state.settings.triple_frame_gen = !state.settings.triple_frame_gen;
         if (state.settings.triple_frame_gen) {
             // 3X runs on what this sets up; it stays on afterwards.
@@ -1593,7 +1665,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     try {
         state.executable_directory = executable_directory();
         state.local_directory = local_app_data() / L"OFXR Bridge";
-        state.settings_path = state.local_directory / L"tray.ini";
+        state.settings_path = state.local_directory / L"dual-gpu-tray.ini";
         std::wstring cleanup_error;
         if (!cleanup_all_owned_registrations(state, &cleanup_error)) {
             log_lifecycle(state.local_directory, L"startup-cleanup", cleanup_error);
@@ -1658,15 +1730,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         return EXIT_FAILURE;
     }
 
-    // Arm straight away: launching the tray is the user asking for the
-    // bridge. A failure leaves it disarmed with the reason shown, exactly as
-    // the menu item would; the menu can retry.
-    {
-        std::wstring arm_error;
-        if (!arm_bridge(state, &arm_error)) {
-            show_error(window, arm_error);
-        }
-    }
+    // The custom prototype always starts disarmed. Select its worker/settings,
+    // then explicitly Arm; stock's direct-launch mutex remains held throughout.
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
