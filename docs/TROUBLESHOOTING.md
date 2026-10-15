@@ -1,25 +1,27 @@
 # OFXR Bridge troubleshooting
 
 > [!IMPORTANT]
-> **First, make sure you are on the latest version: 0.2.13.3.** Every
+> **First, make sure you are on the latest version: 0.2.13.4.** Every
 > release fixes problems reported here, so check the
 > [releases page](https://github.com/djules75/OFXR-Bridge/releases) before
 > anything else. The tray's menu shows the version you are running.
 
-> [!WARNING]
-> **Pimax headsets: use SteamVR, not Pimax OpenXR.** Pimax Play's OpenXR
-> runtime keeps an extra copy in VRAM of every image it is handed, so OFXR
-> costs about **1.5 times** more on it than on SteamVR, and the copies stay
-> until the game closes. We have reported it to Pimax so they can fix their
-> runtime; there is nothing OFXR can do about it in the meantime. Until it is
-> fixed, run your Pimax through SteamVR with
+> [!TIP]
+> **Pimax headsets:** OFXR uses less VRAM through SteamVR with
 > [sboys3's native SteamVR driver](https://store.pimax.com/blogs/blogs/sboys3-native-steamvr-driver-setup-guide)
-> and make SteamVR the active OpenXR runtime (SteamVR → Settings → OpenXR).
-> This matters most in MSFS 2024, which is already close to the VRAM limit
-> at Pimax resolutions. Details in
-> [How much VRAM OFXR uses](#how-much-vram-ofxr-uses).
+> than through Pimax OpenXR, so we recommend it, especially in MSFS 2024.
+> [Details](#how-much-vram-ofxr-uses).
 
 ## Step 1: is OFXR running in your game?
+
+**Performance issues? Try Reset to default first.** If you have changed any
+of OFXR's settings in the tray, right-click the tray icon, click **Reset to
+default**, and restart the game. It puts back the settings that cost the
+most performance when changed: optical flow **NVIDIA Medium** at **50%**
+resolution, **NVIDIA bidirectional consistency** off, **Prefer FPS over
+latency** on and **Lower VRAM** on. Many stutter and low frame rate reports
+come from these settings alone ([why](#optical-flow-settings)). If the
+problem is still there after the restart, carry on below.
 
 Turn on the FPS overlay: right-click the tray icon, **FPS overlay**, pick a
 corner. Start the game and look at that corner in the headset.
@@ -28,7 +30,7 @@ corner. Start the game and look at that corner in the headset.
 |---|---|---|
 | No number at all | OFXR is not loaded in the game | [Table A](#a-ofxr-is-not-loaded) |
 | A **red** number | OFXR is loaded but not generating frames | [Table B](#b-ofxr-is-loaded-but-not-generating) |
-| A **green** number | OFXR is generating frames | [Table C](#c-ofxr-works-but-it-does-not-feel-better) |
+| A **green** number | OFXR is generating frames | **Reset to default** (above) if you have not yet, then [Table C](#c-ofxr-works-but-it-does-not-feel-better) |
 | **Two orange bars** before the number | Frame generation is paused | Choose **Resume frame generation** in the tray menu, or press the pause key (Ctrl + Alt + F7 unless you changed it) |
 
 Vulkan games (No Man's Sky, for example) show no FPS number. For those, use
@@ -70,14 +72,37 @@ not loaded (Table A).
 | Your GPU runs out of VRAM | OFXR needs extra video memory on top of the game (see [How much VRAM OFXR uses](#how-much-vram-ofxr-uses)). Signs: stutter, sudden drops, or a crash, often after a few minutes. Lower the game's settings or the per-eye resolution first. |
 | 3X doesn't switch while you play | The game was started with **Prefer FPS over latency** off. Restart the game. |
 | The number stops short of the refresh rate (110 to 115 at 120 Hz, for example), although the game runs above half of it without OFXR | Generating frames costs GPU time too, so the game needs some headroom above half the refresh rate. Lower the refresh rate, the per-eye resolution or the optical-flow resolution. Example: No Man's Sky ran at 94 FPS without OFXR; OFXR gave an even 100 at 100 Hz and 113 to 115 at 120 Hz, because a real frame plus a generated one took about 17.7 ms and 120 Hz allows 16.7. |
+| Choppy or below half your refresh rate with **Optical flow resolution** above 50%, **NVIDIA Slow**, or **NVIDIA bidirectional consistency** on | These cost a lot of GPU time (see [Optical flow settings](#optical-flow-settings)). Click **Reset to default** in the tray and restart the game. |
 | Dips only in heavy scenes | Disarm OFXR and play the same scene. If the dips are still there, lower the per-eye resolution: OFXR can't make up frames the game doesn't render. |
 | One eye flickers or shimmers and the other is fine (MSFS 2024 with 3X Frame Gen) | Fixed in 0.2.12.2. Update. |
 | One eye stutters in a D3D11 game, and the stutter goes away with OpenXR Toolkit on (IL-2 Great Battles) | Fixed in 0.2.13.2. Update. |
 | On SteamVR, lower frame rates on 0.2.13.1 than on earlier versions, with SteamVR at half your refresh rate (MSFS 2024, often with 3X Frame Gen) | Fixed in 0.2.13.2. Update. |
 | The overlay shows your full refresh rate in green, but the headset looks no smoother than without OFXR, on Pimax OpenXR or Virtual Desktop since 0.2.13.1 (MSFS 2024 with 3X Frame Gen at a high resolution) | Fixed in 0.2.13.3. Update. At a very high resolution a few frames can still be skipped: pick **NVIDIA Fast** or one step down in your headset's render resolution for more headroom. |
+| On 0.2.13.3, stutter and a frame rate below half your refresh rate as soon as a scene gets heavier, on SteamVR (any headset), or on Virtual Desktop and Pimax OpenXR with **Prefer FPS over latency** on; or the overlay stuck at half your refresh rate (The Callisto Protocol) | Fixed in 0.2.13.4. Update. |
 | The frame rate drops when a window or HUD panel appears in the headset, and on Virtual Desktop stays low after it closes (CheekyFoveatedDLSS's F8 window, Skyrim VR's HUD on a Steam Frame) | Fixed in 0.2.13.2. Update. If it still happens, send a flight log. |
 | Stutter or drop-outs that 0.2.9.1 did not have, with VRAM to spare (seen on an AMD RX 9070 XT in AMS2) | Untick **Lower VRAM (may cause stuttering)** in the tray and restart the game. It restores the layout 0.2.9.1 used, at about 15% more VRAM. |
 | You want to know whether a problem comes from OFXR | **Disarm** and restart the game. **Pause frame generation** is not enough: a paused game still runs through OFXR, it only stops making extra frames. |
+
+## Optical flow settings
+
+To make an in-between frame, OFXR first works out how every part of the
+image moved between two game frames: the optical flow. Two tray options
+change how much GPU time that takes, and both are best left at their
+defaults.
+
+- **Optical flow resolution (default 50%)**: the resolution the motion is
+  worked out at, as a share of your per-eye resolution on each side. 100%
+  is four times as many pixels as 50% and costs about that much more, for
+  an image that looks almost the same. NVIDIA Slow at 100% on a Pimax
+  Crystal Light at 120 Hz took about 26 ms per frame pair, three times a
+  refresh, and played choppier than at 50%.
+- **NVIDIA bidirectional consistency (default off)**: works the motion out
+  forward and backward and checks one against the other. It slightly
+  improves the edges of moving objects and doubles the optical-flow cost.
+
+If the game has little headroom, either one can cost more than the extra
+frames give back. **Reset to default** in the tray puts both back to their
+defaults, along with the other settings that matter most for performance.
 
 ## How much VRAM OFXR uses
 
@@ -125,9 +150,10 @@ the switch.
 > 2.0 GB instead of 1.36 on D3D12 and 2.5 instead of 1.67 on D3D11. SteamVR
 > does not do this; the other runtimes have not been measured yet. We have
 > reported it to Pimax so they can fix their runtime, and there is nothing
-> OFXR can do about it for now: run your Pimax through SteamVR with
-> [sboys3's native SteamVR driver](https://store.pimax.com/blogs/blogs/sboys3-native-steamvr-driver-setup-guide)
-> instead, especially for MSFS 2024.
+> OFXR can do about it for now. If VRAM is tight, we recommend running your
+> Pimax through SteamVR with
+> [sboys3's native SteamVR driver](https://store.pimax.com/blogs/blogs/sboys3-native-steamvr-driver-setup-guide),
+> especially for MSFS 2024.
 
 **Know your real per-eye resolution.** It is what your VR software asks the
 game to render, not the headset's panel and not the "100%" figure. In

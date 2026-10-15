@@ -16,8 +16,13 @@ only (see below).
 Technically, OFXR Bridge is an experimental OpenXR API layer. It uses
 optical flow to generate frames between the ones the game renders.
 
-Current release: **v0.2.13.3 (internal build V452)**.
-See the [release notes](docs/releases/0.2.13.3.md). 0.2.13.3 is a patch
+Current release: **v0.2.13.4 (internal build V463)**.
+See the [release notes](docs/releases/0.2.13.4.md). 0.2.13.4 is a patch
+release: on SteamVR, 0.2.13.3 could stutter and drop below half your
+refresh rate as soon as a scene got heavier, and with **Prefer FPS over
+latency** on it could do the same on Virtual Desktop and Pimax OpenXR;
+that is fixed, and the tray has a new **Reset to default** entry.
+[0.2.13.3](docs/releases/0.2.13.3.md) was a patch
 release: on Pimax OpenXR, Virtual Desktop and other runtimes that are not
 SteamVR, a demanding game (MSFS 2024 with 3X Frame Gen at a high
 resolution, for example) could show the full refresh rate on the overlay
@@ -38,18 +43,11 @@ added a tray switch for the VRAM saving of 0.2.10.1.
 and 0.2.12.1 lets you pause and resume frame generation while you play,
 from the tray or with a key you choose.
 
-> [!WARNING]
-> **Pimax headsets: use SteamVR, not Pimax OpenXR.** Pimax Play's OpenXR
-> runtime keeps an extra copy in VRAM of every image it is handed, so OFXR
-> costs about **1.5 times** more on it than on SteamVR, and the copies stay
-> until the game closes. We have reported it to Pimax so they can fix their
-> runtime; there is nothing OFXR can do about it in the meantime. Until it is
-> fixed, run your Pimax through SteamVR with
+> [!TIP]
+> **Pimax headsets:** OFXR uses less VRAM through SteamVR with
 > [sboys3's native SteamVR driver](https://store.pimax.com/blogs/blogs/sboys3-native-steamvr-driver-setup-guide)
-> and make SteamVR the active OpenXR runtime (SteamVR → Settings → OpenXR).
-> This matters most in MSFS 2024, which is already close to the VRAM limit
-> at Pimax resolutions. Details in the
-> [troubleshooting guide](docs/TROUBLESHOOTING.md#how-much-vram-ofxr-uses).
+> than through Pimax OpenXR, so we recommend it, especially in MSFS 2024.
+> [Details](docs/TROUBLESHOOTING.md#how-much-vram-ofxr-uses).
 
 ## 🛠️ Not working, or not feeling smoother?
 
@@ -106,7 +104,10 @@ The current build provides:
 
 - AMD FidelityFX Optical Flow (the fallback: used automatically on GPUs where NVIDIA optical flow is unavailable)
 - NVIDIA Optical Flow with Fast (test), Medium and Slow presets (the default, Medium)
-- 100%, 75% and 50% NVIDIA optical-flow calculation scales
+- 100%, 75% and 50% optical-flow resolution, for both backends (50%, the
+  default, is the one to keep; see below)
+- NVIDIA bidirectional consistency (off by default; doubles the optical-flow
+  cost)
 - a tray icon that arms the bridge as soon as it starts, with manual
   Arm/Disarm
 - **Pause frame generation**: switch generation off and back on while you
@@ -118,6 +119,9 @@ The current build provides:
   for games at a third of your refresh rate, switchable live while you play
 - **Lower VRAM** (on by default): about half a gigabyte less VRAM at high
   resolutions; untick it if that shows as stutter on your card
+- **Reset to default**: puts the optical flow, its resolution,
+  bidirectional consistency, Prefer FPS over latency and Lower VRAM back to
+  their defaults in one click
 - a pipeline built specifically for SteamVR's compositor
 - a **D3D11 bridge** (on by default): D3D11 games run on the same pipeline
   as native D3D12 games, and the OpenXR runtime never touches the game's
@@ -232,6 +236,29 @@ OFXR Bridge does not replace your active OpenXR runtime.
 
 FidelityFX is the most performing one but will produce artifacts during headset rotation in dark areas, this is known and cannot be avoided.
 
+### Optical flow resolution
+
+Tray option **Optical flow resolution**, **50% by default**. Before it can
+make an in-between frame, OFXR works out how every part of the image moved
+between two game frames: that is the optical flow. This option sets the
+resolution it is worked out at, as a share of your per-eye resolution on
+each side, for both FidelityFX and NVIDIA. 100% means four times as many
+pixels as 50%, and costs GPU time to match: NVIDIA Slow at 100% on a Pimax
+Crystal Light at 120 Hz took about 26 ms per frame pair, three times the
+8.3 ms a refresh lasts, and the result was choppier, not smoother. 50% gives
+almost the same image, because the motion is smoothed over areas anyway.
+**Keep 50%** unless your game has plenty of headroom and you see artifacts
+on fine detail.
+
+### NVIDIA bidirectional consistency
+
+Tray option under **Optical flow backend**, **off by default**, NVIDIA only.
+On, the optical flow is worked out twice, forward and backward, and the two
+are checked against each other, which slightly improves the edges of moving
+objects. It doubles the cost of the optical flow. **Leave it off** unless
+your game has headroom to spare. Both options take effect the next time the
+game starts, and **Reset to default** puts both back.
+
 ### Prefer FPS over latency
 
 This tray option is **on by default**. The bridge holds each generated frame
@@ -290,6 +317,16 @@ for it, and unticking this brought the smoothness back.
 Untick it if you see that and have VRAM to spare. It is not a live change:
 the bridge decides the layout when the game creates its VR session, so it
 takes effect the next time the game starts.
+
+### Reset to default
+
+Tray entry **Reset to default**, just below Lower VRAM. It puts back the
+settings that cost the most performance when changed: optical flow
+**NVIDIA Medium**, optical-flow resolution **50%**, **NVIDIA bidirectional
+consistency** off, **Prefer FPS over latency** on and **Lower VRAM** on. If
+OFXR runs worse than you expected and you have changed any of these, start
+here. 3X Frame Gen, the FPS overlay and the flight recorder are left as they
+are. Like those options, it takes effect the next time the game starts.
 
 ### D3D12 and D3D11 games: both eyes taken at the end of the frame
 
