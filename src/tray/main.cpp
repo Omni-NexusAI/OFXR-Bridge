@@ -885,6 +885,29 @@ void apply_pause_hotkey(AppState& state, const std::string& setting) {
     log_lifecycle(state.local_directory, L"pause-hotkey-changed");
 }
 
+// Everything tray.ini holds goes back to LauncherSettings' defaults, the
+// keys with no menu entry and the pause key included, and so do the flight
+// recorder's two knobs that only the layer's ini holds.
+void reset_to_factory_settings(AppState& state) {
+    unregister_pause_hotkey(state);
+    state.settings = xrfg::standalone::LauncherSettings{};
+    // write_runtime_configuration carries max_file_mb and flush_each_event
+    // forward from this version's ini, now or at the next arm, so the
+    // defaults are written there first.
+    const auto runtime_ini =
+        runtime_directory(state.local_directory) / L"ofxr_bridge.ini";
+    std::error_code ignored;
+    std::filesystem::create_directories(runtime_ini.parent_path(), ignored);
+    WritePrivateProfileStringW(L"diagnostics", L"max_file_mb",
+        std::to_wstring(xrfg::standalone::kDefaultMaxFileMb).c_str(),
+        runtime_ini.c_str());
+    WritePrivateProfileStringW(L"diagnostics", L"flush_each_event", L"0",
+        runtime_ini.c_str());
+    update_runtime_options(state);
+    if (state.armed) register_pause_hotkey(state);
+    log_lifecycle(state.local_directory, L"reset-to-default");
+}
+
 void change_pause_hotkey(AppState& state) {
     // Released while the dialog is open, or pressing the current chord in
     // the box would pause the game instead of reaching the box.
@@ -1050,7 +1073,6 @@ void show_context_menu(AppState& state) {
         MF_STRING | (state.settings.single_swapchain_rings ? MF_CHECKED : MF_UNCHECKED),
         toggle_lower_vram,
         L"Lower VRAM (may cause stuttering)");
-    AppendMenuW(menu, MF_STRING, reset_defaults, L"Reset to default");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(
         menu,
@@ -1074,6 +1096,8 @@ void show_context_menu(AppState& state) {
         AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(overlay_menu), L"FPS overlay");
     }
     AppendMenuW(menu, MF_STRING, open_logs, L"Open bridge logs");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, reset_defaults, L"Reset to default...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     HMENU donate_menu = CreatePopupMenu();
     if (donate_menu) {
@@ -1210,26 +1234,31 @@ void handle_command(AppState& state, UINT command) {
             L"see any and have VRAM to spare. Takes effect the next time the "
             L"game starts.");
         break;
-    case reset_defaults: {
-        // The options that cost the most when changed, taken from
-        // LauncherSettings' own defaults; 3X, the overlay and the flight
-        // recorder are left as they are.
-        const xrfg::standalone::LauncherSettings defaults;
-        state.settings.backend = defaults.backend;
-        state.settings.nvidia_preset = defaults.nvidia_preset;
-        state.settings.nvidia_bidirectional = defaults.nvidia_bidirectional;
-        state.settings.nvidia_input_scale = defaults.nvidia_input_scale;
-        state.settings.deep_pipeline = defaults.deep_pipeline;
-        state.settings.single_swapchain_rings = defaults.single_swapchain_rings;
-        update_runtime_options(state);
+    case reset_defaults:
+        if (MessageBoxW(
+                state.window,
+                L"Reset every OFXR setting to its factory default?\n\n"
+                L"Optical flow: NVIDIA Medium at 50%, bidirectional "
+                L"consistency off. Prefer FPS over latency: on. 3X Frame "
+                L"Gen: off. Lower VRAM: on. FPS overlay: upper right. Bridge "
+                L"flight recorder: off. Pause key: Ctrl + Alt + F7. Settings "
+                L"only reachable in tray.ini go back to their defaults too.\n\n"
+                L"The FPS overlay, the flight recorder and 3X Frame Gen change "
+                L"in running games at once; the rest applies the next time the "
+                L"game starts.",
+                L"OFXR Bridge - reset to default",
+                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND |
+                    MB_TOPMOST) != IDYES) {
+            break;
+        }
+        reset_to_factory_settings(state);
         show_balloon(
             state,
-            L"Options reset to default",
-            L"Optical flow: NVIDIA Medium at 50% resolution, bidirectional "
-            L"consistency off. Prefer FPS over latency: on. Lower VRAM: on. "
-            L"Takes effect the next time the game starts.");
+            L"Settings reset to default",
+            L"Every OFXR setting is back to its factory default. Some apply "
+            L"in running games at once, the rest the next time the game "
+            L"starts.");
         break;
-    }
     case toggle_triple_frame_gen:
         state.settings.triple_frame_gen = !state.settings.triple_frame_gen;
         if (state.settings.triple_frame_gen) {
