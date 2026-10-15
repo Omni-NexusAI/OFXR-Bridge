@@ -57,6 +57,7 @@ enum MenuCommand : UINT {
     toggle_deep_pipeline = 118,
     toggle_triple_frame_gen = 119,
     toggle_lower_vram = 126,
+    reset_defaults = 127,
     toggle_diagnostics = 120,
     overlay_off = 121,
     overlay_upper_left = 122,
@@ -1049,6 +1050,7 @@ void show_context_menu(AppState& state) {
         MF_STRING | (state.settings.single_swapchain_rings ? MF_CHECKED : MF_UNCHECKED),
         toggle_lower_vram,
         L"Lower VRAM (may cause stuttering)");
+    AppendMenuW(menu, MF_STRING, reset_defaults, L"Reset to default");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(
         menu,
@@ -1208,6 +1210,25 @@ void handle_command(AppState& state, UINT command) {
             L"see any and have VRAM to spare. Takes effect the next time the "
             L"game starts.");
         break;
+    case reset_defaults: {
+        // The four options above the entry, taken from LauncherSettings'
+        // own defaults; bidirectional consistency, 3X, the overlay and the
+        // flight recorder are left as they are.
+        const xrfg::standalone::LauncherSettings defaults;
+        state.settings.backend = defaults.backend;
+        state.settings.nvidia_preset = defaults.nvidia_preset;
+        state.settings.nvidia_input_scale = defaults.nvidia_input_scale;
+        state.settings.deep_pipeline = defaults.deep_pipeline;
+        state.settings.single_swapchain_rings = defaults.single_swapchain_rings;
+        update_runtime_options(state);
+        show_balloon(
+            state,
+            L"Options reset to default",
+            L"Optical flow: NVIDIA Medium at 50% resolution. Prefer FPS over "
+            L"latency: on. Lower VRAM: on. Takes effect the next time the "
+            L"game starts.");
+        break;
+    }
     case toggle_triple_frame_gen:
         state.settings.triple_frame_gen = !state.settings.triple_frame_gen;
         if (state.settings.triple_frame_gen) {
