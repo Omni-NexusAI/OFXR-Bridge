@@ -40,8 +40,51 @@ std::array<std::size_t, 2> marker_pixels(
 struct FinishedEarly {};
 
 int main(int argc, char** argv) {
-    if (argc < 3 || argc > 6) return 1;
+    if (argc < 3) return 1;
     const std::string mode = argv[2];
+    // "pacing <runtime> <shape> <game_ms> <seconds> [log_copy]": the release
+    // hold against a runtime that paces its waits to a 100 Hz display, with
+    // an application that spends game_ms of wall time on each frame between
+    // its xrBeginFrame and its xrEndFrame. runtime is steamvr,
+    // virtual-desktop or pimax (whose presenter needs -pipelined); shape is
+    // deep, shallow or triple, with suffixes below. Prints the application's
+    // frame rate and the synthetic rate over seconds of wall time after the
+    // presenter has started, and fails if the application is held in a frame
+    // call for 3 s. The last argument is either a path the flight log is
+    // copied to, or --min-fps=N, which also fails a run whose application
+    // ran slower than N frames a second.
+    const bool pacing_test = mode == "pacing";
+    if (argc > (pacing_test ? 8 : 6)) return 1;
+    if (pacing_test && argc < 7) return 1;
+    const std::string pacing_runtime = pacing_test ? argv[3] : "";
+    const std::string pacing_shape = pacing_test ? argv[4] : "";
+    // game_ms may carry GPU time as "<cpu>+<gpu>": that much work is queued on
+    // the application's D3D12 queue at the end of each frame's CPU time, just
+    // ahead of its xrEndFrame, so the layer's copy and synthesis start that
+    // much after it, as behind a game whose GPU finishes its frame late.
+    // D3D12 sessions only.
+    const std::string pacing_game = pacing_test ? argv[5] : "";
+    const double pacing_game_ms = pacing_test ? std::atof(pacing_game.c_str()) : 0.0;
+    const double pacing_gpu_ms = pacing_game.find('+') == std::string::npos
+        ? 0.0 : std::atof(pacing_game.c_str() + pacing_game.find('+') + 1);
+    const double pacing_seconds = pacing_test ? std::atof(argv[6]) : 0.0;
+    const std::string pacing_last = pacing_test && argc == 8 ? argv[7] : "";
+    const bool pacing_min_given = pacing_last.starts_with("--min-fps=");
+    const double pacing_min_fps = pacing_min_given ? std::atof(pacing_last.c_str() + 10) : 0.0;
+    const std::string pacing_log_copy = pacing_min_given ? "" : pacing_last;
+    // Suffixes: -d3d11, a D3D11 session on the direct interop; -pipelined,
+    // the application waits for its next frame before it ends this one, as
+    // MSFS 2024 does, which takes the pipelined presenter.
+    const bool pacing_d3d11 = pacing_shape.find("-d3d11") != std::string::npos;
+    const bool pacing_pipelined = pacing_shape.find("-pipelined") != std::string::npos;
+    const std::string pacing_depth = pacing_shape.substr(0, pacing_shape.find('-'));
+    if (pacing_test && ((pacing_runtime != "steamvr" && pacing_runtime != "virtual-desktop" &&
+        pacing_runtime != "pimax") ||
+        (pacing_depth != "deep" && pacing_depth != "shallow" && pacing_depth != "triple") ||
+        pacing_seconds <= 0.0 || pacing_game_ms < 0.0 || pacing_gpu_ms < 0.0 ||
+        (pacing_d3d11 && pacing_gpu_ms > 0.0))) return 1;
+    if (pacing_runtime == "virtual-desktop") g_runtime_name_override = "VirtualDesktopXR (Bundled)";
+    else if (pacing_runtime == "pimax") g_runtime_name_override = "Pimax OpenXR";
     // "pause" as the third argument drives the tray's reversible pause in
     // place of the Disarm, and resumes afterwards.
     const bool pause_test = argc == 4 && std::string(argv[3]) == "pause";
@@ -83,6 +126,15 @@ int main(int argc, char** argv) {
     // The interop keeps the private rings; every D3D12 mode takes the
     // single-swapchain rings the shipped ini turns on.
     g_single_rings = mode != "d3d11";
+    if (pacing_test) {
+        g_paced_runtime = true;
+        g_steamvr_runtime_mode = g_steamvr_presenter_mode = pacing_runtime == "steamvr";
+        g_d3d11_interop_mode = pacing_d3d11;
+        g_single_rings = !pacing_d3d11;
+        // The rings the interop asks for: two synthetic slots deep or in 3X.
+        g_deep_pipeline = pacing_depth != "shallow";
+        g_frames_per_application_frame = pacing_depth == "triple" ? 3 : 2;
+    }
     g_test_application_thread_id = GetCurrentThreadId();
     const auto root = std::filesystem::temp_directory_path() /
         (L"ofxr-disarm-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
@@ -117,9 +169,14 @@ int main(int argc, char** argv) {
         for (const wchar_t c : control) ascii_control.push_back(static_cast<char>(c));
         {
             std::ofstream ini(root / L"ofxr_bridge.ini");
-            ini << "[ofxr]\nbackend=fidelityfx\ncontrol_event=" << ascii_control
-                // The hand-off is read back from the flight log.
-                << "\n[diagnostics]\nlogging_enabled=" << (handoff_loop || marker_mode == "on" || marker_mode == "hidden" ? 1 : 0)
+            ini << "[ofxr]\nbackend=fidelityfx\ncontrol_event=" << ascii_control;
+            if (pacing_test)
+                ini << "\ndeep_pipeline=" << (pacing_depth != "shallow" ? 1 : 0)
+                    << "\ntriple_frame_gen=" << (pacing_depth == "triple" ? 1 : 0);
+            ini // The hand-off and the pacing are read back from the flight log.
+                << "\n[diagnostics]\nlogging_enabled="
+                << (pacing_test || handoff_loop || marker_mode == "on" || marker_mode == "hidden" ? 1 : 0)
+                << "\nmax_file_mb=" << (pacing_test ? 256 : 32)
                 << "\n[overlay]\nposition=" << (!marker_mode.empty() && marker_mode != "hidden" ? "upper_right" : "off") << '\n';
         }
         require(g_d3d11_interop_mode ? initialize_d3d11() : initialize_d3d12(), "initialize GPU fixture");
@@ -348,6 +405,175 @@ int main(int argc, char** argv) {
                 "the first file is left as it was closed");
             std::cout << "recorder: " << first.size() << " bytes in the first file, "
                       << switched_on << " of them from before the switch" << std::endl;
+            result = 0;
+            throw FinishedEarly{};
+        }
+        if (pacing_test) {
+            using Clock = std::chrono::steady_clock;
+            const auto copy_log = [&] {
+                if (pacing_log_copy.empty()) return;
+                for (const auto& entry : std::filesystem::directory_iterator(root)) {
+                    if (entry.path().extension() != L".log") continue;
+                    std::error_code copied;
+                    std::filesystem::copy_file(entry.path(), pacing_log_copy,
+                        std::filesystem::copy_options::overwrite_existing, copied);
+                }
+            };
+            // A hold that never ends leaves the application inside
+            // xrEndFrame for good; report it and leave, since nothing can
+            // tear the session down from here.
+            std::atomic<Clock::rep> progress{Clock::now().time_since_epoch().count()};
+            std::atomic<bool> finished{false};
+            std::thread watchdog([&] {
+                while (!finished.load()) {
+                    Sleep(100);
+                    const Clock::time_point last{Clock::duration(progress.load())};
+                    if (!finished.load() && Clock::now() - last > std::chrono::seconds(3)) {
+                        std::cout << "pacing " << pacing_runtime << ' ' << pacing_shape
+                                  << ": HUNG - no frame call returned for 3 s" << std::endl;
+                        copy_log();
+                        TerminateProcess(GetCurrentProcess(), 3);
+                    }
+                }
+            });
+            const auto game = std::chrono::microseconds(
+                static_cast<long long>(pacing_game_ms * 1000.0));
+            const XrDuration presenter_period = kFakeDisplayPeriod * g_frames_per_application_frame;
+            // The GPU load: clears of a large render target, as many as take
+            // pacing_gpu_ms, recorded once into a few lists used in turn.
+            ComPtr<ID3D12Resource> load_target;
+            ComPtr<ID3D12DescriptorHeap> load_heap;
+            std::array<ComPtr<ID3D12CommandAllocator>, 4> load_allocators;
+            std::array<ComPtr<ID3D12GraphicsCommandList>, 4> load_lists;
+            std::size_t load_next = 0;
+            if (pacing_gpu_ms > 0.0) {
+                D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+                D3D12_RESOURCE_DESC desc{};
+                desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                desc.Width = 2048; desc.Height = 2048; desc.DepthOrArraySize = 1; desc.MipLevels = 1;
+                desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1;
+                desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+                require(SUCCEEDED(g_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&load_target))), "load target");
+                D3D12_DESCRIPTOR_HEAP_DESC heap_desc{}; heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+                heap_desc.NumDescriptors = 1;
+                require(SUCCEEDED(g_device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&load_heap))), "load heap");
+                g_device->CreateRenderTargetView(load_target.Get(), nullptr,
+                    load_heap->GetCPUDescriptorHandleForHeapStart());
+                const auto record = [&](std::size_t index, int clears) {
+                    if (!load_allocators[index])
+                        require(SUCCEEDED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                            IID_PPV_ARGS(&load_allocators[index]))), "load allocator");
+                    require(SUCCEEDED(load_allocators[index]->Reset()), "load allocator reset");
+                    if (!load_lists[index])
+                        require(SUCCEEDED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                            load_allocators[index].Get(), nullptr, IID_PPV_ARGS(&load_lists[index]))), "load list");
+                    else require(SUCCEEDED(load_lists[index]->Reset(load_allocators[index].Get(), nullptr)), "load list reset");
+                    for (int i = 0; i < clears; ++i) {
+                        const float colour[4]{static_cast<float>(i & 1), 0.0F, 0.0F, 1.0F};
+                        load_lists[index]->ClearRenderTargetView(
+                            load_heap->GetCPUDescriptorHandleForHeapStart(), colour, 0, nullptr);
+                    }
+                    require(SUCCEEDED(load_lists[index]->Close()), "load list close");
+                };
+                // Calibrate on this machine's WARP: time a run of clears.
+                constexpr int kProbeClears = 16;
+                record(0, kProbeClears);
+                double probe_ms = 0.0;
+                for (int pass = 0; pass < 3; ++pass) {
+                    const auto probe_start = Clock::now();
+                    ID3D12CommandList* lists[]{load_lists[0].Get()};
+                    g_queue->ExecuteCommandLists(1, lists);
+                    require(wait_for_queue_idle(), "load calibration");
+                    probe_ms = std::chrono::duration<double, std::milli>(Clock::now() - probe_start).count();
+                }
+                const int clears = std::max(1, static_cast<int>(pacing_gpu_ms / probe_ms * kProbeClears));
+                for (std::size_t index = 0; index < load_lists.size(); ++index) record(index, clears);
+                const auto check_start = Clock::now();
+                ID3D12CommandList* lists[]{load_lists[0].Get()};
+                g_queue->ExecuteCommandLists(1, lists);
+                require(wait_for_queue_idle(), "load check");
+                std::cout << "pacing: GPU load " << clears << " clears, measured "
+                          << std::chrono::duration<double, std::milli>(Clock::now() - check_start).count()
+                          << " ms for " << pacing_gpu_ms << " asked" << std::endl;
+            }
+            // A list is reused four frames later, by when the queue has long
+            // finished it: the layer's own hold keeps at most two in flight.
+            // The load's lists are released with this scope. A queue that does
+            // not drain - the layer's waits on it outlive a session cut short
+            // - would have them released while it still reads them, so then
+            // they are kept for the life of the process instead.
+            const auto retire_gpu_load = [&] {
+                if (!load_target || wait_for_queue_idle()) return;
+                for (auto& list : load_lists) list.Detach();
+                for (auto& allocator : load_allocators) allocator.Detach();
+                load_heap.Detach();
+                load_target.Detach();
+            };
+            const auto queue_gpu_load = [&] {
+                if (!load_target) return;
+                ID3D12CommandList* lists[]{load_lists[load_next].Get()};
+                g_queue->ExecuteCommandLists(1, lists);
+                load_next = (load_next + 1) % load_lists.size();
+            };
+            XrFrameState pipelined_next{XR_TYPE_FRAME_STATE};
+            bool pipelined_started = false;
+            const auto frame = [&] {
+                XrFrameState state{XR_TYPE_FRAME_STATE};
+                if (pacing_pipelined && pipelined_started) state = pipelined_next;
+                else require(XR_SUCCEEDED(wait(session, nullptr, &state)), "paced wait");
+                require(XR_SUCCEEDED(begin(session, nullptr)), "paced begin");
+                capture();
+                sleep_until_precise(Clock::now() + game);
+                // A game submits most of its frame's GPU work as it finishes
+                // the frame on the CPU, so all of it trails the xrEndFrame.
+                queue_gpu_load();
+                if (pacing_pipelined) {
+                    // The next frame's wait before this frame's end.
+                    pipelined_next = XrFrameState{XR_TYPE_FRAME_STATE};
+                    require(XR_SUCCEEDED(wait(session, nullptr, &pipelined_next)), "pipelined wait");
+                    pipelined_started = true;
+                }
+                submit(state.predictedDisplayTime);
+                progress.store(Clock::now().time_since_epoch().count());
+                return pacing_pipelined ? pipelined_next.predictedDisplayPeriod
+                                        : state.predictedDisplayPeriod;
+            };
+            int presenter_at = -1;
+            int frames = 0;
+            double elapsed = 0.0;
+            std::uint32_t synthetics = 0;
+            try {
+                for (int i = 0; i < 400 && presenter_at < 0; ++i)
+                    if (frame() == presenter_period) presenter_at = i;
+                // A second for the presenter's grid and the hold to settle.
+                const auto settled = Clock::now() + std::chrono::seconds(1);
+                while (Clock::now() < settled) frame();
+                const auto synthetic_before = g_synthetic_release_calls.load();
+                const auto start = Clock::now();
+                const auto stop = start + std::chrono::duration_cast<Clock::duration>(
+                    std::chrono::duration<double>(pacing_seconds));
+                while (Clock::now() < stop) { frame(); ++frames; }
+                elapsed = std::chrono::duration<double>(Clock::now() - start).count();
+                synthetics = g_synthetic_release_calls.load() - synthetic_before;
+            } catch (...) {
+                finished = true;
+                watchdog.join();
+                copy_log();
+                retire_gpu_load();
+                throw;
+            }
+            finished = true;
+            watchdog.join();
+            copy_log();
+            retire_gpu_load();
+            std::cout << "pacing " << pacing_runtime << ' ' << pacing_shape << " game "
+                      << pacing_game << " ms: presenter at frame " << presenter_at << ", "
+                      << frames / elapsed << " game frames/s, " << synthetics / elapsed
+                      << " synthetics/s over " << elapsed << " s (display 100 Hz)" << std::endl;
+            require(presenter_at >= 0, "the session takes the presenter");
+            require(frames / elapsed >= pacing_min_fps,
+                "the application runs at the rate the presenter can consume");
             result = 0;
             throw FinishedEarly{};
         }

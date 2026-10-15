@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(XRFrameGenerationBridge VERSION 0.452.0 LANGUAGES CXX)
+project(XRFrameGenerationBridge VERSION 0.461.0 LANGUAGES CXX)
 
 if(MSVC)
     # API layers are injected into hosts that can preload an older game-local
@@ -579,6 +579,22 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             add_test(NAME xrfg_frame_loop_${shape_name} COMMAND xrfg_layer_manual_disarm_tests
                 $<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic> frame-loop ${shape})
             set_tests_properties(xrfg_frame_loop_${shape_name} PROPERTIES TIMEOUT 60)
+        endforeach()
+        # The once-per-frame hold against a runtime paced to a 100 Hz display,
+        # in the deeper pipeline, with a game that takes 3 ms: the application
+        # has to run at the presenter's two frames per game frame, about 50 a
+        # second, not at three (33), which is what waiting for a pop the
+        # pipeline holds back on purpose cost on SteamVR and Virtual Desktop.
+        # A D3D11 session holds at admission, which must never hold for good.
+        # Wall-clock timing, so they carry needs_gpu_timing.
+        foreach(case
+                "steamvr;deep" "virtual-desktop;deep"
+                "steamvr;deep-d3d11" "virtual-desktop;deep-d3d11")
+            string(REPLACE ";" "_" case_name "${case}")
+            add_test(NAME xrfg_release_pacing_${case_name} COMMAND xrfg_layer_manual_disarm_tests
+                $<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic> pacing ${case} 3 3 --min-fps=40)
+            set_tests_properties(xrfg_release_pacing_${case_name} PROPERTIES
+                TIMEOUT 60 LABELS needs_gpu_timing)
         endforeach()
         # The flight recorder switched on, off and on again in a running
         # session: the session records from before the switch head the file.

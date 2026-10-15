@@ -80,6 +80,55 @@ XrSpace g_space = fake_handle<XrSpace>(0x404);
 std::atomic<XrSpace> g_valid_composition_space{g_space};
 std::atomic<bool> g_delay_composition_validation{false};
 XrTime g_next_display_time = 100;
+// A paced runtime, for the release-pacing scenarios: every xrWaitFrame that
+// reaches it blocks to the next display slot of kFakeDisplayPeriod of wall
+// time, one wait per slot, and a wait that arrives after its slot has gone
+// takes the next one, as a compositor does. Display times follow the slots.
+// Off (false) everywhere else, where the fake answers a wait at once.
+bool g_paced_runtime = false;
+std::mutex g_paced_mutex;
+std::chrono::steady_clock::time_point g_paced_epoch{};
+std::int64_t g_paced_last_slot = -1;
+// Sleeps to a wall-clock instant within a few tens of microseconds: a
+// high-resolution waitable timer to just short of it, then a spin.
+void sleep_until_precise(std::chrono::steady_clock::time_point until) {
+    thread_local HANDLE timer = CreateWaitableTimerExW(
+        nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS);
+    constexpr auto kSpin = std::chrono::microseconds(300);
+    const auto remaining = until - std::chrono::steady_clock::now();
+    if (timer != nullptr && remaining > kSpin) {
+        LARGE_INTEGER due{};
+        due.QuadPart = -static_cast<LONGLONG>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                remaining - kSpin).count() / 100);
+        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+            WaitForSingleObject(timer, INFINITE);
+        }
+    }
+    while (std::chrono::steady_clock::now() < until) {
+        std::this_thread::yield();
+    }
+}
+// The slot a paced wait returns at, and its display time.
+XrTime paced_runtime_wait() {
+    const auto period = std::chrono::nanoseconds(kFakeDisplayPeriod);
+    std::int64_t slot = 0;
+    {
+        std::scoped_lock lock(g_paced_mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (g_paced_last_slot < 0) {
+            g_paced_epoch = now;
+        }
+        const auto elapsed = now - g_paced_epoch;
+        const std::int64_t reached = (elapsed + period - std::chrono::nanoseconds(1)) / period;
+        slot = std::max(g_paced_last_slot + 1, reached);
+        g_paced_last_slot = slot;
+    }
+    sleep_until_precise(g_paced_epoch + period * slot);
+    // Scanned out two slots after the wait returns.
+    return 1'000'000'000LL + (slot + 2) * kFakeDisplayPeriod;
+}
 bool g_split_eye_mode = false;
 // Whether the layer under test runs the deeper pipeline. Read from the same
 // ofxr_bridge.ini the layer reads, beside the layer DLL, so the fake runtime
@@ -380,7 +429,8 @@ std::array<ComPtr<ID3D12Resource>, 3> g_synthetic_swapchain_right_b_images;
 }
 
 [[nodiscard]] XrTime fake_camera_time(XrTime display_time) noexcept {
-    if (g_steamvr_presenter_mode || g_flight_simulator_mode) {
+    // A paced runtime's display times are wall-clock slots, a period apart.
+    if (g_paced_runtime || g_steamvr_presenter_mode || g_flight_simulator_mode) {
         return (display_time / kFakeDisplayPeriod) * 100;
     }
     return display_time % kGenerationCooldownDuration;
@@ -535,17 +585,21 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_wait_frame(
     // nothing to correct and this mode stays on the inline path. The internal
     // second cycle is deliberately not slowed - that is the other quirk, and
     // the steamvr-presenter mode covers it.
-    if (g_steamvr_runtime_mode && !g_steamvr_presenter_mode &&
+    std::optional<XrTime> paced_display_time;
+    if (g_paced_runtime) {
+        paced_display_time = paced_runtime_wait();
+    }
+    if (!g_paced_runtime && g_steamvr_runtime_mode && !g_steamvr_presenter_mode &&
         !g_application_in_end_frame.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(7));
     }
     // The throttled inline cycle, as in steamvr-presenter: on any other
     // session this promotes a presenter thread.
-    if (g_single_threaded_mode &&
+    if (!g_paced_runtime && g_single_threaded_mode &&
         g_application_in_end_frame.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(7));
     }
-    if (g_steamvr_presenter_mode) {
+    if (!g_paced_runtime && g_steamvr_presenter_mode) {
         if (GetCurrentThreadId() == g_test_application_thread_id &&
             g_application_in_end_frame.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(7));
@@ -574,7 +628,8 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_wait_frame(
         }
         return XR_ERROR_RUNTIME_FAILURE;
     }
-    frame_state->predictedDisplayTime = g_next_display_time;
+    frame_state->predictedDisplayTime =
+        paced_display_time ? *paced_display_time : g_next_display_time;
     frame_state->predictedDisplayPeriod = kFakeDisplayPeriod;
     frame_state->shouldRender =
         g_next_wait_should_not_render.exchange(false, std::memory_order_acq_rel)

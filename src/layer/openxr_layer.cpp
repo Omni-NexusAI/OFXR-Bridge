@@ -1301,8 +1301,9 @@ struct SessionState {
     // A real frame has gone out and the next hand-over is a frame's first
     // synthetic: the pace looks at it before that hand-over.
     bool triple_release_probe_due{};
-    // Where in its own frame the application is released, on every runtime
-    // but SteamVR: the once-per-frame hold ends when the presenter pops the
+    // Where in its own frame the application is released, wherever the
+    // once-per-frame hold waits for a pop rather than counting
+    // (presenter_holds_by_count): the hold ends when the presenter pops the
     // submission this many places before the frame's real one. 0 is the real
     // frame's own pop; 1 the synthetic before it; up to one less than the
     // frames per application frame, past which the admission bound holds the
@@ -1386,7 +1387,12 @@ struct SessionState {
     // surplus frame lost the history ring's capture slot and was rendered and
     // thrown away -- one application frame in six on UEVR, at a steady beat,
     // never two in a row.
+    //
+    // Where the once-per-frame hold counts (presenter_holds_by_count) it
+    // counts these, repeats included, from application_served_serial, the
+    // count it last released the application at.
     std::uint64_t presenter_frame_serial{};
+    std::uint64_t application_served_serial{};
     bool presenter_stop_requested{};
     bool presenter_active{};
     XrSession handle{XR_NULL_HANDLE};
@@ -2377,6 +2383,7 @@ void stop_continuous_presenter(
     const std::shared_ptr<SessionState>& state) noexcept;
 [[nodiscard]] bool continuous_presenter_active(
     const std::shared_ptr<SessionState>& state) noexcept;
+[[nodiscard]] bool presenter_holds_by_count(const SessionState& state) noexcept;
 // Prevent new enqueues, finish queued/in-flight submissions, then retire any
 // autonomous repeat before invalidating an application-owned handle.
 struct PresenterResourceLifetimeGuard {
@@ -7803,8 +7810,8 @@ struct ReleasePhaseReport {
     std::uint32_t step{};
 };
 
-// One observation for the release phase, at a real frame's pop on a runtime
-// other than SteamVR: whether the next frame's first synthetic is already
+// One observation for the release phase, at a real frame's pop on a session
+// whose hold waits for a pop: whether the next frame's first synthetic is already
 // queued and written, a whole period before its hand-over. Steps the depth
 // when a window closes. presenter_mutex held; the report is for the caller to
 // record once it has let go. See release_phase_depth.
@@ -7852,7 +7859,9 @@ void observe_release_phase(
     }
 }
 
-// 802: the release phase, once a window, on every runtime but SteamVR. a the
+// 802: the release phase, once a window, wherever the hold waits for a pop
+// (presenter_holds_by_count): never on SteamVR, nor in the deeper pipeline
+// unless the application is pipelined. a the
 // depth now in force, in pops before the frame's own real one; b how many of
 // the window's thirty first synthetics were unwritten at their pop or held
 // for it, with the count already written a period early in the bits above
@@ -8538,8 +8547,11 @@ void continuous_presenter_main(
             std::int64_t held_reason = 0;
             // Release phase, recorded after the lock.
             ReleasePhaseReport phase_report{};
+            // Whether the once-per-frame hold waits for this pop.
+            bool hold_waits_for_pop = false;
             {
                 std::scoped_lock lock(state->presenter_mutex);
+                hold_waits_for_pop = !presenter_holds_by_count(*state);
                 if (!state->presenter_stop_requested &&
                     !state->presenter_submissions.empty()) {
                     const auto& front = state->presenter_submissions.front();
@@ -8609,12 +8621,13 @@ void continuous_presenter_main(
                                 // pace looks at it the margin before that, for
                                 // the 3X release delay; elsewhere this is the
                                 // only place to look, and what it steers is
-                                // the release phase.
+                                // the release phase, wherever the hold waits
+                                // for a pop rather than counting.
                                 if (state->dispatch->steamvr_runtime) {
                                     if (state->frames_per_application_frame > 2) {
                                         state->triple_release_probe_due = true;
                                     }
-                                } else {
+                                } else if (!presenter_holds_by_count(*state)) {
                                     observe_release_phase(
                                         *state,
                                         triple_leader_ready(*state),
@@ -8627,8 +8640,14 @@ void continuous_presenter_main(
                     repeated_frame = state->presenter_last_frame;
                 }
             }
-            // The pop is what the once-per-frame hold waits on.
-            state->presenter_condition.notify_all();
+            // The pop is what the once-per-frame hold waits on, where it does
+            // not count. A counted hold is woken where it always was, once
+            // the frame has gone downstream: woken here it would release the
+            // application before the presenter's own runtime calls instead
+            // of after them.
+            if (hold_waits_for_pop) {
+                state->presenter_condition.notify_all();
+            }
             // Recorded outside presenter_mutex, which the application waits
             // on. result=400: a synthetic held for the pipeline's depth;
             // 401: held because its output had not been written yet; 402: one
@@ -9736,11 +9755,12 @@ void continuous_presenter_main(
             state->presenter_last_frame = std::move(seed_frame);
         }
         state->presenter_frame_state_valid = false;
-        // Sequences restart with the presenter; a pop or an enqueue from a
-        // previous one would release the first hold of this one straight
-        // away or never. The release phase is kept: it describes the title
-        // and the machine, not the presenter.
+        // Sequences and counts restart with the presenter; a pop, an enqueue
+        // or a count from a previous one would release the first hold of this
+        // one straight away or never. The release phase is kept: it describes
+        // the title and the machine, not the presenter.
         state->presenter_frame_serial = 0;
+        state->application_served_serial = 0;
         state->presenter_popped_sequence = 0;
         state->last_enqueued_frame_sequence = 0;
         // A schedule left over from a previous presenter would stall the first
@@ -9855,19 +9875,59 @@ void stop_continuous_presenter(
     return !(state.dispatch && state.dispatch->steamvr_runtime);
 }
 
-// Holds the application until the presenter pops a chosen submission of the
-// frame it has just handed over: for a pair, the one release_phase_depth
-// places before its real frame; for a prime, the prime itself. Deliberately
-// returns nothing: it is called after the frame has already been handed over,
-// so a presenter that stops or fails while this waits must not turn a
-// submitted frame into an error - it just stops waiting.
+// Whether the once-per-frame hold counts presenter frames, repeats included,
+// rather than waiting for the presenter to pop a chosen submission of the
+// frame (see wait_for_presenter_pair). It counts on SteamVR, and in the
+// deeper pipeline wherever the presenter keeps a frame to repeat, which is
+// everywhere but a pipelined application. presenter_mutex held.
 //
-// The target is a sequence, not a count of presenter frames. Counting from
-// the last release made the phase a matter of history - a prime, a repeat or
-// a late frame each moved it, and a held prime fixed it at the real frame's
-// pop after every reset - and the phase is what decides whether the next
-// frame's synthetics exist when they are handed over. See
-// release_phase_depth for the measurements.
+// Waiting for a pop puts whatever delays that pop on the application's own
+// thread. In the deeper pipeline the presenter holds each synthetic until it
+// is a display period old, and longer while its output is unwritten, so a
+// hold that waits for one of the frame's pops releases the application a
+// period or two later than the count did, every frame. Measured on Skyrim VR
+// on a Steam Frame at 72 Hz: 31 game frames a second with the count, 15 with
+// the pop, the age hold firing on 95% of frames and the readiness hold on
+// 97%, the application held 54 ms in xrEndFrame against 8. The same build on
+// a 100 Hz fake runtime, Virtual Desktop's rules, a game of 3 ms: 50 game
+// frames a second counted, 33 popped. Counted, the application is released on
+// the presenter's cadence whatever it pops, and the depth the pipeline buys
+// stays in the queue rather than on the game's thread. Where the presenter
+// can hold a synthetic back it already keeps an unwritten one from going out,
+// which is the other thing the pop was for.
+//
+// Where it cannot - the shallow pipeline, 3X, or a pipelined application,
+// whose frames the presenter never keeps - an unwritten synthetic goes out
+// and the compositor shows the previous frame in its place, so where in its
+// own frame the application is released decides whether the synthetics
+// exist when they are due. There the pop is the hold, at the measured
+// release_phase_depth. MSFS 2024 in 3X on a Pimax Crystal Super handed over
+// 99.6% of its synthetics unwritten with the count and 7.6% with the pop.
+// SteamVR's 3X steers the same thing with the release delay instead, and
+// SteamVR has never been released at a measured phase.
+[[nodiscard]] bool presenter_holds_by_count(const SessionState& state) noexcept {
+    if (state.dispatch && state.dispatch->steamvr_runtime) {
+        return true;
+    }
+    return state.deep_pipeline && !state.pipelined_presenter_mode;
+}
+
+// Holds the application until the presenter has got far enough through the
+// frame it has just been handed, by one of two measures (see
+// presenter_holds_by_count): a count of presenter frames, repeats included,
+// since the application was last released - a pair's two or three, one for a
+// prime - or the pop of a chosen submission of the frame - for a pair the one
+// release_phase_depth places before its real frame, for a prime the prime
+// itself. Deliberately returns nothing: it is called after the frame has
+// already been handed over, so a presenter that stops or fails while this
+// waits must not turn a submitted frame into an error - it just stops waiting.
+//
+// The count leaves where in its own frame the application is released to
+// history - a prime, a repeat or a late frame each moves it, and a held prime
+// fixes it at the real frame's pop after every reset. The pop chooses it, and
+// where the presenter cannot hold an unwritten synthetic back, that is what
+// decides whether the next frame's synthetics exist when they are handed
+// over. See release_phase_depth for the measurements.
 //
 // This is the gate that paces the application on the presenter path. The
 // capacity bounds in xrEndFrame sit beside it and are normally slack, so
@@ -9901,30 +9961,36 @@ void wait_for_presenter_pair(
     try {
         const auto entered = std::chrono::steady_clock::now();
         std::unique_lock lock(state->presenter_mutex);
-        // The frame's real submission: the one enqueued last, or, at
-        // admission, the last of the ones about to be. The prediction is
-        // exact: the admission hold exists only in the deeper pipeline
-        // (presenter_hold_at_admission), which is 2X, and a 2X pair enqueues
-        // exactly two; nothing else enqueues between the two sites, the
-        // presenter's own enqueue being its seed frame at start. It has to
-        // be exact on a session with a frame to repeat - a target past the
-        // frame's own real one would wait for a pop only the next enqueue
-        // can produce, and that enqueue waits on this.
+        // At admission the frame's own submissions do not exist yet: a pop
+        // to wait for there would have to be predicted from the enqueue to
+        // come, and a target the presenter cannot reach before that enqueue
+        // would never be met, since the enqueue waits on this. The count
+        // needs no prediction.
+        const bool by_count = !enqueued || presenter_holds_by_count(*state);
         const std::uint64_t frames = state->frames_per_application_frame.load();
-        const std::uint64_t real_sequence = enqueued
-            ? state->last_enqueued_frame_sequence
-            : state->next_presenter_sequence + (pairable ? frames - 1 : 0);
-        // A prime is released at its own pop, whatever the depth: held for
-        // that one pop it absorbs the surplus a reset's stall leaves, so the
-        // first pair after it waits its whole count and nothing bursts (see
-        // presenter_holds_primes for the exception). The depth is clamped
-        // once more here, against the shape at this moment.
-        const std::uint64_t depth = pairable
-            ? std::min<std::uint64_t>(
-                  state->release_phase_depth, frames > 0 ? frames - 1 : 0)
-            : 0;
-        const std::uint64_t target =
-            real_sequence > depth ? real_sequence - depth : 0;
+        std::uint64_t target = 0;
+        if (by_count) {
+            // A frame's worth of presenter frames past the count the
+            // application was last released at.
+            target = state->application_served_serial + (pairable ? frames : 1U);
+        } else {
+            // The frame's real submission is the one enqueued last. A prime
+            // is released at its own pop, whatever the depth: held for that
+            // one pop it absorbs the surplus a reset's stall leaves, so the
+            // first pair after it waits its whole count and nothing bursts
+            // (see presenter_holds_primes for the exception). The depth is
+            // clamped once more here, against the shape at this moment.
+            const std::uint64_t real_sequence = state->last_enqueued_frame_sequence;
+            const std::uint64_t depth = pairable
+                ? std::min<std::uint64_t>(
+                      state->release_phase_depth, frames > 0 ? frames - 1 : 0)
+                : 0;
+            target = real_sequence > depth ? real_sequence - depth : 0;
+        }
+        const auto reached_now = [&] {
+            return by_count ? state->presenter_frame_serial
+                            : state->presenter_popped_sequence;
+        };
         state->presenter_condition.wait(lock, [&] {
             // A presenter with nothing queued and nothing to repeat stops
             // counting until the application gives it something - which,
@@ -9934,7 +10000,7 @@ void wait_for_presenter_pair(
             const bool presenter_starved =
                 state->presenter_submissions.empty() &&
                 state->presenter_last_frame == nullptr;
-            return state->presenter_popped_sequence >= target ||
+            return reached_now() >= target ||
                    presenter_starved ||
                    XR_FAILED(state->presenter_failure) ||
                    state->presenter_stop_requested;
@@ -9948,8 +10014,15 @@ void wait_for_presenter_pair(
         // this hold is not throttling anything - the application is gated
         // only by whatever it blocks on next, which is the frame-start
         // synthesis fence, and that one meters nothing.
-        const std::uint64_t reached = state->presenter_popped_sequence;
+        const std::uint64_t reached = reached_now();
         const std::uint64_t surplus = reached > target ? reached - target : 0;
+        // The next counted hold counts from here, whichever measure this one
+        // used, so a session that moves from one to the other - a live
+        // switch between 3X and the deeper pipeline - starts from where it
+        // is. Assigning the count reached rather than advancing by the frame
+        // means an application that arrives late catches up in one step, and
+        // the surplus is what that step discards.
+        state->application_served_serial = state->presenter_frame_serial;
         // 3X on SteamVR only: see triple_release_delay. Elsewhere the phase
         // above is what moves the release, and the delay stays at zero.
         const std::chrono::nanoseconds release_offset =
@@ -9986,7 +10059,9 @@ void wait_for_presenter_pair(
             }
         }
         // result the surplus; a the hold in microseconds; b the sequence the
-        // presenter had popped; c the sequence the release waited for.
+        // presenter had popped; c the sequence the release waited for. Where
+        // the hold counts (presenter_holds_by_count, or at admission), b and c
+        // are presenter frame counts.
         xrfg::bridge_flight_logger().event(
             xrfg::BridgeFlightOperation::presenter_pair_release,
             static_cast<std::int64_t>(surplus),
@@ -12258,6 +12333,8 @@ void apply_live_frame_multiplier(
                 std::min(state->release_phase_depth, target - 1U);
             state->release_phase_window_early = 0;
             state->release_phase_hold = 0;
+            // A counted hold counts from here in the new shape.
+            state->application_served_serial = state->presenter_frame_serial;
         }
         clear_generation_continuity(state);
         xrfg::bridge_flight_logger().event(
