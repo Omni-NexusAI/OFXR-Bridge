@@ -15,13 +15,15 @@
 ## Step 1: is OFXR running in your game?
 
 **Performance issues? Try Reset to default first.** If you have changed any
-of OFXR's settings in the tray, right-click the tray icon, click **Reset to
-default**, and restart the game. It puts back the settings that cost the
-most performance when changed: optical flow **NVIDIA Medium** at **50%**
-resolution, **NVIDIA bidirectional consistency** off, **Prefer FPS over
-latency** on and **Lower VRAM** on. Many stutter and low frame rate reports
-come from these settings alone ([why](#optical-flow-settings)). If the
-problem is still there after the restart, carry on below.
+of OFXR's settings, right-click the tray icon, click **Reset to
+default...** near the bottom of the menu, confirm, and restart the game. It
+puts every OFXR setting back to its factory default, including the ones
+that cost the most performance when changed: optical flow **NVIDIA
+Medium** at **50%** resolution, **NVIDIA bidirectional consistency** off,
+**Prefer FPS over latency** on and **Lower VRAM** on. Many stutter and low
+frame rate reports come from these settings alone
+([why](#optical-flow-settings)). If the problem is still there after the
+restart, carry on below.
 
 Turn on the FPS overlay: right-click the tray icon, **FPS overlay**, pick a
 corner. Start the game and look at that corner in the headset.

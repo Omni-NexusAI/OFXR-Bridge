@@ -16,7 +16,7 @@ only (see below).
 Technically, OFXR Bridge is an experimental OpenXR API layer. It uses
 optical flow to generate frames between the ones the game renders.
 
-Current release: **v0.2.13.4 (internal build V463)**.
+Current release: **v0.2.13.4 (internal build V464)**.
 See the [release notes](docs/releases/0.2.13.4.md). 0.2.13.4 is a patch
 release: on SteamVR, 0.2.13.3 could stutter and drop below half your
 refresh rate as soon as a scene got heavier, and with **Prefer FPS over
@@ -119,9 +119,8 @@ The current build provides:
   for games at a third of your refresh rate, switchable live while you play
 - **Lower VRAM** (on by default): about half a gigabyte less VRAM at high
   resolutions; untick it if that shows as stutter on your card
-- **Reset to default**: puts the optical flow, its resolution,
-  bidirectional consistency, Prefer FPS over latency and Lower VRAM back to
-  their defaults in one click
+- **Reset to default**: puts every OFXR setting back to its factory default
+  in one click, after asking
 - a pipeline built specifically for SteamVR's compositor
 - a **D3D11 bridge** (on by default): D3D11 games run on the same pipeline
   as native D3D12 games, and the OpenXR runtime never touches the game's
@@ -320,13 +319,16 @@ takes effect the next time the game starts.
 
 ### Reset to default
 
-Tray entry **Reset to default**, just below Lower VRAM. It puts back the
-settings that cost the most performance when changed: optical flow
-**NVIDIA Medium**, optical-flow resolution **50%**, **NVIDIA bidirectional
-consistency** off, **Prefer FPS over latency** on and **Lower VRAM** on. If
-OFXR runs worse than you expected and you have changed any of these, start
-here. 3X Frame Gen, the FPS overlay and the flight recorder are left as they
-are. Like those options, it takes effect the next time the game starts.
+Tray entry **Reset to default...**, in its own section below **Open bridge
+logs**. After you confirm, it puts every OFXR setting back to its factory
+default: optical flow **NVIDIA Medium** at **50%** resolution, **NVIDIA
+bidirectional consistency** off, **Prefer FPS over latency** on, **3X Frame
+Gen** off, **Lower VRAM** on, the FPS overlay in the upper right, the flight
+recorder off and the pause key back to **Ctrl + Alt + F7**. Settings only
+reachable by editing `tray.ini` go back to their defaults too.
+If OFXR runs worse than you expected and you have changed any settings,
+start here. The FPS overlay, the flight recorder and 3X Frame Gen change in
+a running game at once; the rest applies the next time the game starts.
 
 ### D3D12 and D3D11 games: both eyes taken at the end of the frame
 
