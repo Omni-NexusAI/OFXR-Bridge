@@ -30,6 +30,9 @@ enum class NvidiaInputScale {
 };
 
 struct LauncherSettings {
+    // Persist a hardware identity, never an adapter ordinal or a reboot-local LUID.
+    bool dual_gpu_enabled{};
+    std::string dual_gpu_worker_id;
     // NVIDIA optical flow, medium, is the default: the layer falls back to
     // FidelityFX on its own where NVIDIA cannot initialise, so the default
     // can be the better backend without a GPU check here.

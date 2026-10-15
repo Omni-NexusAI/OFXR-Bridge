@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <string>
 
 namespace xrfg::embedded {
 // CPU-only interface: no NGX/FFX structures cross the host/backend ABI boundary.
@@ -11,6 +12,8 @@ struct Settings {
     bool backward{};
     int motion_vectors{}; // 0 optical flow, 1 DLSS ingress
     int frame_generation{}; // ABI compatibility: standalone accepts only 0.
+    bool dual_gpu_enabled{};
+    std::wstring dual_gpu_worker_id;
     bool operator==(const Settings&) const = default;
 };
 struct Snapshot {

@@ -1,5 +1,6 @@
 #include "xrfg/d3d12_history.hpp"
 #include "xrfg/d3d12_frame_synthesizer.hpp"
+#include "xrfg/d3d12_dual_gpu.hpp"
 #include "xrfg/dlss_motion_vectors.hpp"
 #include "xrfg/d3d11_bridge.hpp"
 #include "xrfg/d3d11_d3d12_interop.hpp"
@@ -33,6 +34,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -780,6 +782,8 @@ struct SessionState {
     xrfg::implicit_layer::ManualArmControl manual_control;
     std::uint64_t control_id{xrfg::embedded::attach()};
     std::uint64_t control_revision{}; // frame_call_mutex
+    bool dual_gpu_requested{}; // fixed for this session; changes require a new session
+    std::wstring dual_gpu_worker_id;
     bool control_reconfigure_required{};
     // The tray's pause as last applied by apply_embedded_control, which
     // folds it into menu_enabled.
@@ -1968,6 +1972,28 @@ void log_completed_nvidia_gpu_timings(
     if (!synthesizer || !xrfg::bridge_flight_logger().enabled()) {
         return;
     }
+    if (synthesizer->dual_gpu()) {
+        xrfg::DualGpuTiming timing{};
+        while (synthesizer->consume_dual_gpu_timing(&timing) == S_OK) {
+            auto& logger = xrfg::bridge_flight_logger();
+            logger.event(xrfg::BridgeFlightOperation::dual_gpu_transport,
+                static_cast<std::int64_t>(timing.serial), timing.input_us, timing.worker_us, timing.output_us);
+            logger.event(xrfg::BridgeFlightOperation::dual_gpu_deadline,
+                timing.published ? 1 : 0, timing.token, timing.age_us, timing.deadline_qpc);
+            const auto& flow = timing.flow_and_synthesis;
+            logger.event(xrfg::BridgeFlightOperation::nvidia_gpu_stages,
+                static_cast<std::int64_t>(flow.current_serial), flow.pack_microseconds,
+                flow.eye0_microseconds, flow.eye1_microseconds);
+            logger.event(xrfg::BridgeFlightOperation::nvidia_gpu_total, 0,
+                flow.composition_microseconds, flow.total_microseconds, timing.serial);
+            if (flow.gpu_begin_qpc && flow.gpu_end_qpc)
+                logger.event(xrfg::BridgeFlightOperation::synthesis_gpu_span,
+                    static_cast<std::int64_t>(flow.total_microseconds),
+                    logger.microseconds_for_counter(static_cast<std::int64_t>(flow.gpu_begin_qpc)),
+                    logger.microseconds_for_counter(static_cast<std::int64_t>(flow.gpu_end_qpc)), timing.serial);
+        }
+        return;
+    }
     for (;;) {
         xrfg::D3D12NvidiaGpuTiming timing{};
         const HRESULT result =
@@ -2843,7 +2869,7 @@ template <typename Initialize>
     const SynthesisInitializeRecord& record,
     Initialize&& initialize) {
     xrfg::D3D12OpticalFlowBackend backend = session.optical_flow_backend;
-    if (backend == xrfg::D3D12OpticalFlowBackend::nvidia &&
+    if (!session.dual_gpu_requested && backend == xrfg::D3D12OpticalFlowBackend::nvidia &&
         session.nvidia_backend_unavailable) {
         backend = xrfg::D3D12OpticalFlowBackend::fidelity_fx;
     }
@@ -2864,7 +2890,7 @@ template <typename Initialize>
         return result;
     };
     HRESULT result = attempt(backend);
-    if (FAILED(result) && backend == xrfg::D3D12OpticalFlowBackend::nvidia) {
+    if (!session.dual_gpu_requested && FAILED(result) && backend == xrfg::D3D12OpticalFlowBackend::nvidia) {
         xrfg::bridge_flight_logger().event(
             xrfg::BridgeFlightOperation::synthesis_initialize,
             result,
@@ -3049,6 +3075,17 @@ create_d3d12_frame_generation_swapchains(
         const HRESULT gpu_result = initialize_synthesis_with_fallback(
             *state->session, initialize_record,
             [&](xrfg::D3D12OpticalFlowBackend backend) {
+        if (state->session->dual_gpu_requested) {
+            // The existing D3D11 bridge has already produced primary-adapter
+            // D3D12 history here. Vulkan and direct D3D11 interop are deferred.
+            if (!single_rings || state->session->vulkan_bridge ||
+                state->session->frames_per_application_frame != 2) return E_INVALIDARG;
+            return synthesizer->initialize_dual_gpu(
+                state->session->d3d12_device.Get(), state->session->d3d12_queue.Get(),
+                state->d3d12_history, current_destinations_raw, synthetic_destinations_raw,
+                static_cast<DXGI_FORMAT>(state->create_info.format), D3D12_RESOURCE_STATE_COMMON,
+                state->session->dual_gpu_worker_id, state->session->nvidia_options);
+        }
         return synthesizer->initialize(
             state->session->d3d12_device.Get(),
             state->session->d3d12_synthesis_queue
@@ -3311,6 +3348,7 @@ create_d3d11_frame_generation_swapchains(
         gpu_result = initialize_synthesis_with_fallback(
             *session, initialize_record,
             [&](xrfg::D3D12OpticalFlowBackend backend) {
+                if (session->dual_gpu_requested) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
                 return synthesizer->initialize(
                     session->d3d12_device.Get(),
                     session->d3d12_queue.Get(),
@@ -3592,6 +3630,7 @@ create_vulkan_frame_generation_swapchains(
         gpu_result = initialize_synthesis_with_fallback(
             *session, initialize_record,
             [&](xrfg::D3D12OpticalFlowBackend backend) {
+                if (session->dual_gpu_requested) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
                 return synthesizer->initialize(
                     session->d3d12_device.Get(),
                     session->d3d12_queue.Get(),
@@ -4838,6 +4877,8 @@ XrResult layer_create_session_impl(
 
     auto state = std::make_shared<SessionState>(dispatch);
     const auto initial_control = xrfg::embedded::snapshot();
+    state->dual_gpu_requested = initial_control.desired.dual_gpu_enabled;
+    state->dual_gpu_worker_id = initial_control.desired.dual_gpu_worker_id;
     state->optical_flow_backend = static_cast<xrfg::D3D12OpticalFlowBackend>(initial_control.desired.backend);
     state->nvidia_options = {
         static_cast<xrfg::D3D12NvidiaPerformancePreset>(initial_control.desired.preset),
@@ -4851,10 +4892,10 @@ XrResult layer_create_session_impl(
     // the private swapchain rings and the admission bounds.
     state->deep_pipeline =
         xrfg::implicit_layer::read_deep_pipeline(current_layer_directory());
-    const bool triple_requested =
+    const bool triple_requested = !state->dual_gpu_requested &&
         xrfg::implicit_layer::read_triple_frame_gen(current_layer_directory());
     state->single_swapchain_rings =
-        xrfg::implicit_layer::read_single_swapchain_rings(current_layer_directory());
+        state->dual_gpu_requested || xrfg::implicit_layer::read_single_swapchain_rings(current_layer_directory());
     state->capture_at_end_frame =
         xrfg::implicit_layer::read_capture_at_end_frame(current_layer_directory());
     state->vulkan_support =
@@ -4862,7 +4903,8 @@ XrResult layer_create_session_impl(
     state->pause_applied = state->manual_control.pause_requested();
     state->recorder_applied = xrfg::bridge_flight_logger().enabled();
     state->menu_enabled = initial_control.desired.enabled && !state->pause_applied;
-    state->dlss_motion_vectors = initial_control.desired.motion_vectors == 1;
+    state->dlss_motion_vectors = !state->dual_gpu_requested && initial_control.desired.motion_vectors == 1;
+    if (state->dual_gpu_requested) state->optical_flow_backend = xrfg::D3D12OpticalFlowBackend::nvidia;
     state->control_revision = initial_control.revision;
     xrfg::embedded::applied(state->control_id, state->control_revision, state->menu_enabled, 0);
     XrStructureType binding_structure_type = XR_TYPE_UNKNOWN;
@@ -5093,7 +5135,7 @@ XrResult layer_create_session_impl(
     state->two_slot_synthetic_ring =
         state->deep_pipeline || state->frames_per_application_frame > 2;
     state->triple_switchable =
-        triple_binding && state->two_slot_synthetic_ring;
+        !state->dual_gpu_requested && triple_binding && state->two_slot_synthetic_ring;
     if (triple_binding && !state->triple_switchable) {
         state->fixed_frame_multiplier.hold();
     }
@@ -5255,6 +5297,30 @@ XrResult layer_create_session_impl(
         return XR_ERROR_RUNTIME_FAILURE;
     }
     *session = created_session;
+    // Diagnostic identity comes from the actual finalized runtime binding.
+    // It has no role in adapter selection or xrGetD3D12GraphicsRequirementsKHR.
+    try {
+        LUID luid{}; bool known = false;
+        if (state->d3d12_device) { luid = state->d3d12_device->GetAdapterLuid(); known = true; }
+        else if (state->d3d11_device) {
+            Microsoft::WRL::ComPtr<IDXGIDevice> device; Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+            DXGI_ADAPTER_DESC desc{};
+            if (SUCCEEDED(state->d3d11_device.As(&device)) && SUCCEEDED(device->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&desc))) {
+                luid = desc.AdapterLuid; known = true;
+            }
+        }
+        if (known) {
+            Microsoft::WRL::ComPtr<IDXGIFactory4> factory; Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+            DXGI_ADAPTER_DESC1 desc{};
+            if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&
+                SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))) && SUCCEEDED(adapter->GetDesc1(&desc))) {
+                std::ofstream report(current_layer_directory() / L"presentation_gpu.txt", std::ios::trunc);
+                report << GetCurrentProcessId() << '\n';
+                for (wchar_t c : std::wstring_view(desc.Description)) report << (c < 128 ? static_cast<char>(c) : '?');
+                report << '\n' << handle_value(created_session) << '\n';
+            }
+        }
+    } catch (...) {}
     return result;
 }
 
@@ -5275,6 +5341,15 @@ XrResult layer_destroy_session_impl(XrSession session) {
 
     const XrResult result = state->dispatch->destroy_session(session);
     if (XR_SUCCEEDED(result)) {
+        try {
+            const auto path = current_layer_directory() / L"presentation_gpu.txt";
+            std::ifstream report(path); unsigned long pid{}; std::uint64_t owner{}; std::string description;
+            report >> pid; report.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            std::getline(report, description); report >> owner; report.close();
+            if (pid == GetCurrentProcessId() && owner == handle_value(session)) {
+                std::error_code error; std::filesystem::remove(path, error);
+            }
+        } catch (...) {}
         std::scoped_lock lock(g_state_mutex);
         for (auto iterator = g_swapchains.begin(); iterator != g_swapchains.end();) {
             if (iterator->second->session == state) {
@@ -7241,6 +7316,14 @@ struct GeneratedFrameEndInfo {
         std::uint64_t value{};
     };
     std::vector<ReadyFence> synthetic_ready;
+    struct OffloadOutput {
+        std::shared_ptr<xrfg::D3D12FrameSynthesizer> synthesizer;
+        xrfg::D3D12FrameSynthesisTicket ticket;
+    };
+    std::vector<OffloadOutput> offload_outputs;
+    // Same immutable B snapshot, both eyes, owned staging. A missed synthetic
+    // slot selects this whole frame, never one worker eye or an older result.
+    std::shared_ptr<GeneratedFrameEndInfo> offload_original;
     // As on PresenterSubmission, kept here as well so a repeat of this frame
     // can make the same join.
     std::uint64_t app_release_value{};
@@ -7251,6 +7334,8 @@ struct GeneratedFrameEndInfo {
 // the frame should go down and fail where the runtime can see it.
 [[nodiscard]] bool synthetic_output_ready(
     const GeneratedFrameEndInfo& frame) noexcept {
+    for (const auto& output : frame.offload_outputs)
+        if (!output.synthesizer->offload_ready(output.ticket)) return false;
     for (const auto& ready : frame.synthetic_ready) {
         if (ready.fence == nullptr || ready.value == 0) {
             continue;
@@ -7262,6 +7347,14 @@ struct GeneratedFrameEndInfo {
         }
     }
     return true;
+}
+
+[[nodiscard]] bool publish_offload_frame(GeneratedFrameEndInfo& frame) noexcept {
+    if (frame.offload_outputs.empty()) return true;
+    return xrfg::dual_gpu_publish_transaction(frame.offload_outputs,
+        [](const auto& output) { return output.synthesizer->offload_ready(output.ticket); },
+        [](const auto& output) { return SUCCEEDED(output.synthesizer->publish_offload(output.ticket)); },
+        [](const auto& output) { output.synthesizer->discard_offload(output.ticket); });
 }
 
 // Joins the application's queue to synthesis and releases each image to the
@@ -7295,12 +7388,15 @@ bool run_private_releases(
                     continue;
                 }
             }
-            if (session->d3d12_synthesis_queue &&
-                pending.generation->synthesizer) {
-                static_cast<void>(
-                    pending.generation->synthesizer->synchronize_consumer_queue(
-                        runtime_queue(*session),
-                        pending.ticket));
+            if (pending.generation->synthesizer &&
+                (session->d3d12_synthesis_queue || pending.ticket.offload_token)) {
+                const auto joined = pending.generation->synthesizer->synchronize_consumer_queue(
+                    runtime_queue(*session), pending.ticket);
+                if (pending.ticket.offload_token && FAILED(joined)) {
+                    if (pending.staging) static_cast<void>(release_private_image(session, session->dispatch, *pending.image));
+                    all_released = false;
+                    continue;
+                }
             }
             if (pending.staging != nullptr) {
                 ID3D12Resource* destination =
@@ -8564,6 +8660,7 @@ void continuous_presenter_main(
                         front->owned_frame && front->owned_frame->synthetic;
                     const bool too_young = holdable_synthetic && age < period;
                     const bool not_written = holdable_synthetic &&
+                        front->owned_frame->offload_outputs.empty() &&
                         !too_young &&
                         age < period * kReadinessHoldPeriods &&
                         !synthetic_output_ready(*front->owned_frame);
@@ -8671,11 +8768,26 @@ void continuous_presenter_main(
             // Never for a repeat - its images were released when it first
             // went down, and the slot may have been reacquired since.
             if (request && request->owned_frame) {
+                if (!request->owned_frame->offload_outputs.empty() &&
+                    !publish_offload_frame(*request->owned_frame)) {
+                    discard_private_releases(state.get(), request->owned_frame->pending_releases);
+                    // Both eyes and their pose/FOV are selected together. The
+                    // current completion is independent from the worker.
+                    request->owned_frame = request->owned_frame->offload_original;
+                }
+            }
+            if (request && request->owned_frame) {
                 const bool joined =
                     !request->owned_frame->pending_releases.empty() &&
                     state->d3d12_synthesis_queue != nullptr;
-                run_private_releases(
+                const bool released = run_private_releases(
                     state.get(), request->owned_frame->pending_releases);
+                if (!released && !request->owned_frame->offload_outputs.empty() && request->owned_frame->offload_original) {
+                    for (const auto& output : request->owned_frame->offload_outputs)
+                        output.synthesizer->discard_offload(output.ticket);
+                    request->owned_frame = request->owned_frame->offload_original;
+                    run_private_releases(state.get(), request->owned_frame->pending_releases);
+                }
                 if (joined) {
                     signal_join_probe(
                         state.get(),
@@ -11110,6 +11222,10 @@ struct PreparedProjectionFrame {
         const bool defer_current_copy = generation->interop == nullptr &&
             !state->session->deep_pipeline;
         xrfg::D3D12FrameSynthesisTicket ticket{};
+        if (generation->synthesizer->dual_gpu()) {
+            const auto period_us = state->session->minimum_runtime_display_period / 1000;
+            generation->synthesizer->offload_budget_us(period_us > 0 ? static_cast<std::uint64_t>(period_us * 2) : 22'222);
+        }
         const auto debug_marker = request_pair && xrfg::bridge_flight_logger().enabled() &&
                 state->session->fps_overlay
             ? state->session->fps_overlay->marker_placement()
@@ -11993,6 +12109,14 @@ void apply_embedded_control(
     if (state->control_revision == control.revision &&
         paused == state->pause_applied &&
         recording == state->recorder_applied) return;
+    if (control.desired.dual_gpu_enabled != state->dual_gpu_requested ||
+        (state->dual_gpu_requested && control.desired.dual_gpu_worker_id != state->dual_gpu_worker_id)) {
+        state->menu_enabled = false;
+        state->control_revision = control.revision;
+        xrfg::embedded::applied(state->control_id, control.revision, false,
+            HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)); // restart required for adapter/transport ownership
+        return;
+    }
     if ((paused != state->pause_applied ||
          recording != state->recorder_applied) &&
         use_continuous_presenter &&
@@ -12008,7 +12132,8 @@ void apply_embedded_control(
     std::scoped_lock gpu_lock(state->gpu_mutex);
     HRESULT result = S_OK;
     auto backend = static_cast<xrfg::D3D12OpticalFlowBackend>(control.desired.backend);
-    if (backend == xrfg::D3D12OpticalFlowBackend::nvidia &&
+    if (state->dual_gpu_requested) backend = xrfg::D3D12OpticalFlowBackend::nvidia;
+    if (!state->dual_gpu_requested && backend == xrfg::D3D12OpticalFlowBackend::nvidia &&
         state->nvidia_backend_unavailable) {
         backend = xrfg::D3D12OpticalFlowBackend::fidelity_fx;
     }
@@ -12023,7 +12148,7 @@ void apply_embedded_control(
     // also see this tuple. A partial failure remains bypass, never mixed flow.
     state->optical_flow_backend = backend;
     state->nvidia_options = options;
-    state->dlss_motion_vectors = control.desired.motion_vectors == 1;
+    state->dlss_motion_vectors = !state->dual_gpu_requested && control.desired.motion_vectors == 1;
     for (const auto& chain : swapchains) {
         std::unique_lock lock(chain->mutex);
         // The same gates the enumeration path applies, and for the same reason.
@@ -12095,10 +12220,10 @@ void apply_embedded_control(
         }
         if (chain->frame_generation && chain->frame_generation->synthesizer) {
             auto& synthesis = chain->frame_generation->synthesizer;
-            result = synthesis->wait_for_idle();
+            result = synthesis->dual_gpu() ? S_OK : synthesis->wait_for_idle();
             if (SUCCEEDED(result) && changed) {
                 result = synthesis->reconfigure(backend, options);
-                if (FAILED(result) &&
+                if (FAILED(result) && !state->dual_gpu_requested &&
                     backend == xrfg::D3D12OpticalFlowBackend::nvidia) {
                     // The menu switched to NVIDIA on a machine without it.
                     // Same fallback as at creation, and the tray is told the
@@ -12449,7 +12574,7 @@ XrResult layer_end_frame_impl(
     // Both promotions hand the presenter its first frame at the top of an
     // xrEndFrame, before the inline second cycle runs, so the handoff never
     // overlaps a frame this thread has already submitted.
-    const bool pipelined_presenter_start_requested =
+    bool pipelined_presenter_start_requested =
         state->pipelined_presenter_start_requested ||
         state->steamvr_presenter_start_requested;
     const bool consume_in_submission_order =
@@ -12669,6 +12794,15 @@ XrResult layer_end_frame_impl(
         log_projection_view_rects(*state, current_snapshot);
     } else {
         resource_mappings.reason = ProjectionMappingReason::no_projection_views;
+    }
+    // Reject split-eye/multiple projection layouts before deferred arming can
+    // create competing NVIDIA OFA contexts. Both eyes must share one stereo
+    // texture; its existing synthesizer serializes the isolated eye jobs.
+    if (state->dual_gpu_requested && resource_mappings.ready() &&
+        !xrfg::dual_gpu_supported_projection(current_snapshot.layers.size(),
+            resource_mappings.mappings.size(),
+            resource_mappings.mappings.empty() ? 0 : resource_mappings.mappings.front().views.size())) {
+        resource_mappings.reason = ProjectionMappingReason::unsupported_view_layout;
     }
     xrfg::bridge_flight_logger().event(
         xrfg::BridgeFlightOperation::projection_mapping,
@@ -12895,10 +13029,12 @@ XrResult layer_end_frame_impl(
             });
         }
         if (deferred.deferred_current != nullptr) {
+            auto current_ticket = deferred.deferred_ticket;
+            if (current_ticket.offload_token) current_ticket.synthetic_fence_value = 0;
             current_releases.releases.push_back({
                 deferred.deferred_generation,
                 deferred.deferred_current,
-                deferred.deferred_ticket,
+                current_ticket,
                 deferred.deferred_current_staging,
                 &deferred.deferred_generation->current_runtime_images,
             });
@@ -12936,6 +13072,14 @@ XrResult layer_end_frame_impl(
     GeneratedFrameEndInfo current_generated{};
     const XrFrameEndInfo* submitted_end_info = end_info;
     bool pair_ready = false;
+    // Offload requires a presentation opportunity after asynchronous return.
+    // Waiting for the stock inline path to produce a successful pair would
+    // never bootstrap it: immediate publication intentionally fails closed.
+    // A successfully prepared original primes the existing presenter handoff.
+    if (state->dual_gpu_requested && !use_continuous_presenter &&
+        prepared.kind == PreparedGenerationKind::prime && !presenter_forbidden(*state)) {
+        pipelined_presenter_start_requested = true;
+    }
     // The frame has a second synthetic: every resource made one.
     bool extra_ready = !prepared.resources.empty();
     std::vector<ProjectionResourceDestination> current_destinations;
@@ -13003,6 +13147,11 @@ XrResult layer_end_frame_impl(
             // the queue after it has been handed to the runtime.
             for (const PreparedProjectionResource& resource :
                  prepared.resources) {
+                if (resource.generation.deferred_ticket.offload_token && resource.generation.deferred_generation) {
+                    first_generated.offload_outputs.push_back({
+                        resource.generation.deferred_generation->synthesizer,
+                        resource.generation.deferred_ticket});
+                }
                 if (resource.generation.synthesizer) {
                     first_generated.pending_current_copies.push_back(
                         {resource.generation.synthesizer,
@@ -13075,6 +13224,8 @@ XrResult layer_end_frame_impl(
                 }
                 presenter_current_frame->pending_releases =
                     current_releases.take();
+                if (!presenter_first_frame->offload_outputs.empty())
+                    presenter_first_frame->offload_original = presenter_current_frame;
             } else {
                 presenter_first_frame->pending_releases =
                     current_releases.take();
@@ -13195,7 +13346,9 @@ XrResult layer_end_frame_impl(
     } else {
         join_runtime_queue_to_application(
             state.get(), state->app_end_frame_release_value);
-        if (!run_private_releases(state.get(), first_generated.pending_releases)) {
+        const bool offload_available = publish_offload_frame(first_generated);
+        if (!offload_available) discard_private_releases(state.get(), first_generated.pending_releases);
+        if (!offload_available || !run_private_releases(state.get(), first_generated.pending_releases)) {
             // The runtime refused a private image at the hand-over, so the
             // frame naming it cannot go down as generated: the application's
             // own frame goes instead, the pair with it is dropped, and the

@@ -231,6 +231,11 @@ enum class BridgeFlightOperation : std::uint32_t {
     // swapchain, b microseconds waited, c the limit in microseconds << 32 |
     // the image index. Nothing is written for a capture whose slot was free.
     history_capture_wait,
+    // Custom transport: result=source serial, a=input GPU us, b=worker GPU us,
+    // c=return GPU us. Each interval uses only its own queue timestamp clock.
+    dual_gpu_transport,
+    // result=1 published/0 dropped, a=token, b=result age us, c=deadline QPC.
+    dual_gpu_deadline,
 };
 
 struct BridgeFlightToken {

@@ -21,6 +21,18 @@ int main() {
     using namespace xrfg::standalone;
 
     const LauncherSettings release_defaults;
+    if (release_defaults.dual_gpu_enabled || !release_defaults.dual_gpu_worker_id.empty()) return 1;
+    LauncherSettings offload;
+    offload.dual_gpu_enabled = true;
+    offload.dual_gpu_worker_id = "pci:00000004:00000000:00000000:ven10de:dev2504:sub12345678:rev01";
+    const auto restored_offload = parse_settings(serialize_settings(offload));
+    if (!restored_offload.dual_gpu_enabled || restored_offload.dual_gpu_worker_id != offload.dual_gpu_worker_id ||
+        !contains(build_runtime_ini(offload), "dual_gpu_enabled=1") ||
+        !contains(build_runtime_ini(offload), "dual_gpu_worker_id=" + offload.dual_gpu_worker_id) ||
+        !contains(build_runtime_ini(release_defaults), "dual_gpu_enabled=0")) {
+        std::cerr << "dual-GPU settings round-trip/default failed\n";
+        return 1;
+    }
     const std::string default_runtime_ini = build_runtime_ini(release_defaults);
     if (release_defaults.overlay_position != xrfg::FpsOverlayPosition::upper_right ||
         !contains(default_runtime_ini, "[overlay]\r\nposition=upper_right")) return 1;
